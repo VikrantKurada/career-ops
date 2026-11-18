@@ -18,6 +18,8 @@ Career-ops is AI-agnostic and runs on several command-line agent tools. The core
 | Hermes Agent | `AGENTS.md` | Interactive: `hermes` (then ask for a career-ops task). Web read-only workers: `hermes chat -q "prompt" --oneshot -Q --no-restore-cwd`. Batch ranking: unsupported. |
 | Oh My Pi | `.omp/AGENTS.md` | Interactive: `omp` (then `/skill:career-ops`). Headless/Batch: `omp -p "prompt"` |
 
+No CLI at all: in this fork `ollama-runner.mjs` runs scan, evaluation, the pipeline, CV tailoring, PDF and application answers on a local Ollama server. [OLLAMA.md](OLLAMA.md) covers it, lists what still needs one of the CLIs above, and describes the untested route of running a CLI on a local model with `ollama launch`.
+
 ## Hermes Agent
 
 Hermes runs the same pipeline as every other CLI here. Trust the checkout once with `hermes skills trust` before interactive use. The web UI uses Hermes's one-shot mode (`hermes chat -q ... --oneshot -Q --no-restore-cwd`) only for explicitly non-writing workers; evaluation and portal-repair workers reject it because no verified Hermes permission adapter exists. Batch ranking does not support Hermes. Hermes project-context scanning still applies; see [`docs/HERMES.md`](HERMES.md) for its rules and limitations.

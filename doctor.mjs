@@ -98,7 +98,7 @@ try {
 // silently diagnosed THIS checkout instead of the one asked for. Handled via
 // lib/cli-flags.mjs's validateFlags() (#2775), which rejects unrecognized
 // flags before --help so `--help --bogus` still errors.
-const KNOWN_FLAGS = ['--target', '--json', '--init-templates', '--strict', '--cli', '--help', '-h'];
+const KNOWN_FLAGS = ['--target', '--json', '--init-templates', '--strict', '--ollama', '--cli', '--help', '-h'];
 
 // Both take a value, as the next argv token or as `--flag=value`. validateFlags
 // accepts either form, so both are read with flagValue(): an indexOf() lookup
@@ -110,6 +110,7 @@ const USAGE = `Usage:
   node doctor.mjs --json             # read-only machine-readable onboarding state
   node doctor.mjs --json --init-templates # create missing personalization files for onboarding
   node doctor.mjs --strict           # also probe portals.yml entries (network)
+  node doctor.mjs --ollama           # check the local Ollama server, model and context size
   node doctor.mjs --target <path>    # diagnose another career-ops checkout
   node doctor.mjs --cli <name>       # check a specific CLI's integration
   node doctor.mjs --help             # show this message
@@ -159,6 +160,18 @@ if (INIT_TEMPLATES && !JSON_OUT) {
 // --strict adds a live reachability probe of every portals.yml entry (network).
 // Opt-in so the default `npm run doctor` stays fast and fully offline.
 const STRICT = argv.includes('--strict');
+// --ollama adds the checks for the local Ollama backend (lib/ollama-doctor.mjs):
+// a few metadata requests to the server, never a generation. Without the flag
+// they run only for an install that uses that backend: one where a variable of
+// the runner's own (OLLAMA_MODEL, OLLAMA_NUM_CTX, …: RUNNER_ENV_VARS in
+// lib/ollama-config.mjs) is set, in the shell or in a .env the runner reads.
+// The Ollama server's variables (OLLAMA_HOST, OLLAMA_KEEP_ALIVE, OLLAMA_MODELS,
+// …) do not count, and neither does --strict, which keeps upstream's meaning:
+// someone who tunes a server or probes their portals has not asked about the
+// runner. In such a run whatever depends on the server (it is off, it lacks the
+// model) is a warning, not a failure: most users never start one, and only
+// someone who asked for the check by name should see doctor go red over it.
+const OLLAMA_FLAG = argv.includes('--ollama');
 
 const cliFlag = flagValue(argv, '--cli') ?? null;
 
@@ -1667,6 +1680,77 @@ async function main() {
     checks.push(await checkPortalSlugs(projectRoot));
   }
 
+  // The local Ollama backend; when it runs is explained at OLLAMA_FLAG. The
+  // settings are the ones the runner would find: the data root's .env, then the
+  // working directory's for whatever the first leaves unset, and the shell over
+  // both. With only the data root's file, a run started from a checkout whose
+  // .env names a model, with the data root elsewhere, certified another model
+  // than the runner then used. --target diagnoses another checkout, which the
+  // folder this command was started from says nothing about. The files are read
+  // here rather than trusted to be in process.env: resolveActiveCli() loads the
+  // data root's only when neither --cli nor CAREER_OPS_CLI named the CLI.
+  //
+  // The checks are loaded here and not imported at the top of this file. They
+  // live in lib/ollama-doctor.mjs, a file the ollama-local fork adds and
+  // upstream does not ship (config/local-paths.txt). A static import of a file
+  // that is not there fails while Node links the module graph, before a line
+  // of this file runs, so a copy holding this doctor.mjs without that file (a
+  // commit or a merge that left it out, a sandbox built from the tracked files
+  // before it was added) lost every check to ERR_MODULE_NOT_FOUND, --json
+  // included. Loaded here, only this step is lost: it is skipped, and --ollama,
+  // which asked for it by name, reports it as a failed check.
+  let ollamaChecked = false;
+  let fileEnv = {};
+  for (const dir of explicitTarget ? [projectRoot] : [process.cwd(), projectRoot]) {
+    try { fileEnv = { ...fileEnv, ...dotenv.parse(readFileSync(join(dir, '.env'))) }; } catch { /* no .env there */ }
+  }
+  let ollamaDoctor = null;
+  try {
+    ollamaDoctor = await import('./lib/ollama-doctor.mjs');
+  } catch (err) {
+    // Only "not in this copy" is skipped. A file that is there and does not
+    // load is a broken file, and is reported as one.
+    if (err?.code !== 'ERR_MODULE_NOT_FOUND') throw err;
+  }
+  if (!ollamaDoctor) {
+    if (OLLAMA_FLAG) {
+      checks.push({
+        pass: false,
+        label: 'Ollama checks are not part of this checkout',
+        fix: 'lib/ollama-doctor.mjs, lib/ollama-client.mjs or lib/ollama-config.mjs is missing: restore the files listed in config/local-paths.txt (branch ollama-local)',
+      });
+    }
+  } else if (OLLAMA_FLAG || ollamaDoctor.ollamaOptIn(process.env, fileEnv)) {
+    // The window is checked against a prompt of the size the owner's own files
+    // give, as the runner sizes it, and not against a typical one: with a long
+    // CV the runner moves to the next window size, and a fixed size passed a
+    // setting the runner then refused. The profile is the one the runner reads,
+    // which loads the .env files first, so a CAREER_OPS_PROFILE in one counts.
+    const envFileProfile = explicitTarget || hasProfileOverride() ? '' : (fileEnv.CAREER_OPS_PROFILE ?? '').trim();
+    const promptTokens = ollamaDoctor.measurePromptTokens({
+      codeRoot,
+      dataRoot: projectRoot,
+      profilePath: envFileProfile ? resolve(envFileProfile) : profilePathFor(projectRoot),
+    });
+    checks.push(...await ollamaDoctor.checkOllama({ env: { ...fileEnv, ...process.env }, promptTokens, soft: !OLLAMA_FLAG }));
+    ollamaChecked = true;
+  }
+
+  // After the Ollama check, which makes requests, the run ends by setting the
+  // exit code and letting the event loop drain, not with process.exit(). On
+  // Windows, Node 24 aborts when process.exit() runs right after a request
+  // (nodejs/node#56645; ollama-eval.mjs lists the affected versions): it prints
+  // a libuv assertion and exits with a crash code instead of 0 or 1. Measured
+  // 2026-11-17 on Node 24.11.1: `doctor --ollama` with every check passing
+  // aborted 8 runs out of 8. The unref'd timer still ends a run that something
+  // holds open, without holding it open itself. A run that skipped the Ollama
+  // check exits exactly as it always has.
+  const endRun = (code) => {
+    if (!ollamaChecked) process.exit(code);
+    process.exitCode = code;
+    setTimeout(() => process.exit(code), 5_000).unref();
+  };
+
   let failures = 0;
   let warnings = 0;
 
@@ -1722,7 +1806,7 @@ async function main() {
       console.log(`${setupNote}.`);
       console.log(setupHint);
     }
-    process.exit(1);
+    endRun(1);
   } else {
     const warnNote = warnings > 0 ? ` (${warnings} warning${warnings === 1 ? '' : 's'} — see above)` : '';
     if (setupNote) {
@@ -1733,7 +1817,7 @@ async function main() {
     }
     console.log('');
     console.log('Join the community: https://discord.gg/8pRpHETxa4');
-    process.exit(0);
+    endRun(0);
   }
 }
 

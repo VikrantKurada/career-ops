@@ -81,7 +81,16 @@ All scripts live in the project root as `.mjs` modules. Most are exposed via
 | `node coverage-check.mjs <url> --company <name> --title <title>` | `coverage-check.mjs` | Explain why the scanners missed a posting you found by hand, and propose the `portals.yml` change that would have caught it (read-only, zero-network) |
 | `node rank-pipeline.mjs` | `rank-pipeline.mjs` | Opt-in LLM relevance re-ranker — annotates pending pipeline rows with a score + reason (off by default) |
 | `npm run gemini:eval` | `gemini-eval.mjs` | Evaluate a JD with Google Gemini (free-tier alternative) |
-| `npm run ollama:eval` | `ollama-eval.mjs` | Evaluate a JD with a local Ollama model |
+| `npm run ollama:eval` | `ollama-runner.mjs` | Evaluate a JD (a URL, or a file with `--file`) with a local Ollama model. In this fork it runs the local runner; the upstream script is still `node ollama-eval.mjs` |
+| `npm run ollama` | `ollama-runner.mjs` | Local Ollama runner: scan/evaluate/pipeline/tailor/pdf/apply with no API key and no agent CLI (see [OLLAMA.md](OLLAMA.md)) |
+| `npm run ollama:scan` | `ollama-runner.mjs` | Run `scan.mjs` through the local runner (zero-token) |
+| `npm run ollama:pipeline` | `ollama-runner.mjs` | Evaluate the pending rows of `data/pipeline.md` on a local model, tick the ones that succeed, merge the tracker |
+| `npm run ollama:tailor` | `ollama-runner.mjs` | Tailor the CV to HTML for one report on a local model |
+| `npm run ollama:pdf` | `ollama-runner.mjs` | Render that tailored CV to PDF via `generate-pdf.mjs` |
+| `npm run ollama:apply` | `ollama-runner.mjs` | Draft application answers for one report on a local model (never submits) |
+| `npm run ollama:run` | `ollama-runner.mjs` | One posting end to end: evaluate, then tailor, PDF and answers when the score is high enough and the report does not advise against applying |
+| `npm run ollama:models` | `ollama-runner.mjs` | List installed Ollama chat models and the default pick |
+| `npm run ollama:doctor` | `ollama-runner.mjs` | Check the Ollama server, model and context size (also `node doctor.mjs --ollama`) |
 | `npm run openai:eval` | `openai-eval.mjs` | Evaluate a JD via any OpenAI-compatible endpoint |
 | `npm run eval:golden` | `eval-golden.mjs` | Compare a candidate model's score block to the frozen golden set (`--replay` is offline) |
 | `npm run star` | `match-star.mjs` | Match a behavioural question to your best STAR story (zero-LLM) |
@@ -1591,6 +1600,34 @@ npm run or:apply                # application assistance
 
 ---
 
+## ollama (local runner)
+
+Runs the pipeline on a local Ollama server: no API key and no agent CLI. It
+is this fork's addition. Setup, environment variables, measured models and
+limits are in [OLLAMA.md](OLLAMA.md).
+
+```bash
+npm run ollama:doctor               # check the server, the model and the context size
+npm run ollama:models               # installed chat models and the default pick
+npm run ollama:scan                 # portal scan (scan.mjs, no model involved)
+npm run ollama:eval -- <url>        # evaluate a job by URL, or with --file <path>
+npm run ollama:pipeline             # process pending URLs in data/pipeline.md
+npm run ollama:tailor -- <report>   # tailored CV HTML for a report (--pdf renders it)
+npm run ollama:pdf -- <report>      # render the tailored CV to PDF
+npm run ollama:apply -- <report>    # draft application answers (never submits)
+npm run ollama:run -- <url>         # evaluate, then tailor, PDF and answers for a good score
+```
+
+`npm run ollama -- --help` prints every option. `node doctor.mjs --ollama`
+adds the Ollama checks to `doctor`.
+
+Give a posting by URL or with `--file`. The runner refuses a posting typed as
+one short line of text, because on Windows npm passes on only the first line
+of quoted text. Do not pipe a file into `npm run` in Windows PowerShell: the
+options after `--` are lost and so is every non-ASCII character.
+
+---
+
 ## reconcile
 
 Syncs the `data/pipeline.md` "Pendientes" section with `batch/batch-state.tsv`.
@@ -1760,13 +1797,16 @@ CLI:
 - `gemini:eval` — Google Gemini free tier (`GEMINI_API_KEY` in `.env`; copy
   `.env.example` and get a free key at https://aistudio.google.com/apikey)
 - `ollama:eval` — fully local and private via Ollama
+  (in this fork it runs `ollama-runner.mjs evaluate`, see
+  [ollama (local runner)](#ollama-local-runner); the upstream script is still
+  `node ollama-eval.mjs`)
 - `openai:eval` — any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq,
   DeepSeek, LM Studio, llama.cpp, vLLM, ...)
 
 ```bash
 npm run gemini:eval -- "We are looking for a Senior AI Engineer..."
 node gemini-eval.mjs --file ./jds/my-job.txt
-npm run ollama:eval -- "JD text"
+npm run ollama:eval -- --file ./jds/my-job.txt
 npm run openai:eval -- "JD text"
 ```
 

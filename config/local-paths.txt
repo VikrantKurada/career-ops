@@ -1,0 +1,25 @@
+# local-paths.txt: files this fork owns that upstream career-ops does not ship.
+#
+# Branch ollama-local adds a local Ollama backend (docs/OLLAMA.md). The first
+# four files below are that backend. The fifth is the rule that tells an agent
+# to sync this fork with git and not with the updater. Listing them here does
+# two things:
+#   - `node update-system.mjs apply` (npm run update) treats them like cv.md and
+#     never writes to them;
+#   - `node validate-system-paths-coverage.mjs` stops reporting them as tracked
+#     files the updater does not know about, which would fail the test suite.
+#
+# Upstream gitignores this file. This fork commits it through the
+# `!config/local-paths.txt` line in .gitignore, so a fresh clone and CI read the
+# same list. Format and rules: config/local-paths.example.txt.
+#
+# Do not list anything under docs/ or tests/. The system layer ships those
+# directories, so update-system.mjs refuses the whole file if one appears here.
+# docs/OLLAMA.md and the tests/ollama-*.test.mjs suites need no entry: the
+# updater removes a file from those directories only if upstream once shipped it.
+
+ollama-runner.mjs
+lib/ollama-config.mjs
+lib/ollama-client.mjs
+lib/ollama-doctor.mjs
+.claude/rules/ollama-fork.md

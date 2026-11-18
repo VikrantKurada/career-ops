@@ -361,6 +361,8 @@ When choosing a budget-friendly model, you need strong reasoning capabilities to
 > As with other hosted providers, this sends your CV and job description to the configured endpoint.
 >
 > Run `node openai-eval.mjs --help` for per-provider examples. For 100% local/private use, point `--url` at a local server (LM Studio / llama.cpp / vLLM) or use `node ollama-eval.mjs`.
+>
+> In this fork the local route is the `ollama:*` scripts, which run the whole pipeline on a local Ollama server: see [OLLAMA.md](OLLAMA.md).
 
 > NVIDIA NIM also works (hosted `https://integrate.api.nvidia.com/v1` or a self-hosted container's `/v1`), e.g. `--model meta/llama-3.3-70b-instruct`. The hosted free tier can queue for minutes, so raise `OPENAI_TIMEOUT_MS` above the 300s default.
 
@@ -595,13 +597,13 @@ node openrouter-runner.mjs help              # Show this help
 
 ### Path B: Fully Local with Ollama (`ollama:eval`)
 
-If you want **zero network calls** and complete privacy, run evaluations against a local Ollama instance:
+If you want no model call to leave your machine, run evaluations against a local Ollama instance:
 
 ```bash
-npm run ollama:eval
+npm run ollama:eval -- --file jd.txt
 ```
 
-This calls `ollama-eval.mjs` which hits your local Ollama server. No API key, no internet, no cost. See [Section 5](#5-local-llm-tradeoffs-ollama--llamacpp) for model size recommendations (32B+ minimum for reliable scoring).
+In this fork that runs `ollama-runner.mjs` against your local Ollama server (give it `--file jd.txt` or a posting URL; a posting given by URL is still read from the job board), and the same runner covers the rest of the pipeline: `ollama:scan`, `ollama:pipeline`, `ollama:tailor`, `ollama:pdf`, `ollama:apply` and `ollama:run`. No API key, no cost. Setup, measured models and limits are in [OLLAMA.md](OLLAMA.md). The upstream single-JD script is still available as `node ollama-eval.mjs`. [Section 5](#5-local-llm-tradeoffs-ollama--llamacpp) has the general model size advice (32B+ minimum for reliable scoring); [OLLAMA.md](OLLAMA.md#models) has what was measured on a 32 GB card.
 
 ### Path C: Any OpenAI-Compatible Endpoint (`openai:eval`)
 

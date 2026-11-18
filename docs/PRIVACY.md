@@ -112,6 +112,7 @@ before `fetch`:
 | `openrouter-runner.mjs` | OpenRouter (both the pinned-model and rotation paths) |
 | `openai-eval.mjs`, `openai-tailor.mjs` | any OpenAI-compatible endpoint |
 | `ollama-eval.mjs` | Ollama (local *or* remote via `OLLAMA_BASE_URL`) |
+| `ollama-runner.mjs` (through `lib/ollama-client.mjs`) | Ollama, on every chat request of the local runner. A filled-in `config/privacy.yml` blocks these local requests too: see [OLLAMA.md](OLLAMA.md#privacy) |
 | `gemini-eval.mjs`, `batch-evaluate-gemini.mjs`, `scan-hn.mjs` | Google Generative AI SDK |
 
 ### 2. Ambient — over global `fetch` (safety net)
