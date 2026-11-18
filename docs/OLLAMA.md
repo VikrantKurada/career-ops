@@ -295,7 +295,7 @@ lists what is missing and how to create each file. In short, four files:
 
 All four are gitignored.
 
-About the fourth file. The copy in this checkout is the shipped template,
+About the fourth file. Until you edit it, your copy is the shipped template,
 `modes/_profile.template.md`, unchanged. It describes the template author's
 six AI roles, not yours, and a posting outside the roles listed there gets
 the lowest mark for fit with your targets. Edit at least these sections: Your
@@ -311,7 +311,7 @@ run of the runner that reads the file prints one note that it
 
 You do not have to create the tracker, `data/applications.md`. The first run
 that merges creates it. If you already have one, see
-[The tracker](#the-tracker): the one in this checkout needs one command.
+[The tracker](#the-tracker): one with nine columns needs one command.
 
 After that the loop is:
 
@@ -390,9 +390,9 @@ The tenth column holds the posting's address. The merge matches rows on it
 before anything else, so a posting that is evaluated twice updates its row.
 
 **If your tracker has nine columns**, add the tenth once. Nine columns is
-what career-ops' own onboarding writes, and it is what this checkout has
-today. With it, every merge of a posting that was read from a URL prints
-`URL dedup is INACTIVE`. This adds the column and changes nothing else:
+what career-ops' own onboarding writes. With nine, every merge of a posting
+that was read from a URL prints `URL dedup is INACTIVE`. This adds the column
+and changes nothing else:
 
 ```powershell
 node merge-tracker.mjs --backfill-urls
@@ -1533,8 +1533,9 @@ git merge upstream/main
 Windows checkout the merge needs one more line before it and one after it:
 see [The six skill files](#the-six-skill-files).
 
-**Commit the fork's work first**, and only the fork's work. While this is
-written it is uncommitted. Git will not merge over uncommitted changes to the
+**Commit the fork's work first**, and only the fork's work. The fork itself is
+committed on the branch `ollama-local`, so this is about what you have changed
+in its files since then. Git will not merge over uncommitted changes to the
 same files, and until the work is committed no updater command can be undone
 safely: see [Do not run the updater](#do-not-run-the-updater).
 
