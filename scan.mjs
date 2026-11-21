@@ -37,7 +37,7 @@
  *   node scan.mjs --help                       # print this usage block and exit
  */
 
-import { buildWorkplacePolicy, isCountryKeyword } from './providers/_country.mjs';
+import { buildWorkplacePolicy, homeCountryCodes, isCountryKeyword, namesPlaceOutsideHome } from './providers/_country.mjs';
 import {
   closeSync,
   existsSync,
@@ -84,11 +84,12 @@ import { OBSERVATIONAL_SCAN_HISTORY_STATUSES, SCAN_HISTORY_COLUMNS, parseScanHis
 import { closesAtIso } from './lib/posting-close.mjs';
 import { escapeFormulaCell } from './lib/tsv-formula-escape.mjs';
 import { sectionKind } from './lib/pipeline-sections.mjs';
-import { canonicalJobKey, normalizeUrl, LANGUAGE_PARAMS, languageSubtag, promoteKnownFragmentIdentity } from './url-key.mjs';
+import { canonicalJobKey, normalizeUrl, LANGUAGE_PARAMS, languageSubtag, promoteKnownFragmentIdentity, canonicalizeKnownPostingUrl, googleCareersJobId } from './url-key.mjs';
 import { getCareerOpsRoot, getProfilePath, hasProfileOverride } from './path-resolver.mjs';
 import { checkLivenessViaApi } from './liveness-api.mjs';
 import { robotsAllows } from './robots-check.mjs';
 import { resolveExperienceFilter, applyExperienceFilter } from './jd-years.mjs';
+import { normalizeEmploymentType, parseEmploymentTypeFilterConfig } from './providers/_employment-type.mjs';
 
 const CODE_ROOT = path.dirname(fileURLToPath(import.meta.url));
 export const DATA_ROOT = getCareerOpsRoot();
@@ -522,7 +523,39 @@ function compileLocationKeyword(keyword) {
   return (lower) => re.test(lower);
 }
 
-function compileLocationKeywordList(value) {
+// Washington, DC is written "DC", "D.C." and "District of Columbia", and its
+// city part is the name of a US state. Two consequences (#7293):
+//   - `block: ["DC"]` missed "Washington, D.C.": the entry "DC" was matched as
+//     an ISO code, so "D.C." never matched it. An entry spelled DC or D.C. (any
+//     case) now matches either spelling, in every tier.
+//   - `allow: ["Washington"]`, written for the state, admitted every DC
+//     posting through the city name. In `allow` and `always_allow` the state
+//     name "Washington" no longer matches the city of Washington, DC, so
+//     "Seattle, Washington" passes and "Washington, DC" (also written
+//     "Washington (DC)" or "Washington - DC") does not, while
+//     "Seattle, Washington; Washington, DC" still passes on its Seattle part.
+//     The abbreviation "WA" is not read as the state, before or after this
+//     change, so list "WA" separately to admit "Seattle, WA". `block`
+//     and `block_hard` keep matching both, so a block written as "Washington"
+//     never gets weaker. The built-in US-state expansion (#3633) is untouched:
+//     with "United States" in always_allow, DC still passes as a US place.
+const DC_TOKEN = String.raw`d\.?\s?c(?:\.|(?![\p{L}\p{M}\p{N}]))`;
+const DC_ENTRY_RE = /^d\.?\s?c\.?$/i;
+const DC_LOCATION_RE = new RegExp(`(?<![\\p{L}\\p{M}\\p{N}])${DC_TOKEN}`, 'u');
+const DC_CITY_RE = new RegExp(`(?<![\\p{L}\\p{M}\\p{N}])washington\\s*[,(\\-\u2013\u2014]?\\s*(?:district of columbia|${DC_TOKEN})`, 'gu');
+const withoutDcCity = (lower) => lower.replace(DC_CITY_RE, 'district of columbia');
+// A Workday URL hint puts the city first ("Washington", "Washington-United-States").
+// When the display location names Washington, DC, a hint that starts with a
+// bare "Washington" is that city, not the state. "Seattle-Washington" and
+// "Washington-State" keep naming the state, and with no DC in the display the
+// hint is read as before. The hint arrives with its dashes turned into spaces.
+const DC_CITY_TEST_RE = new RegExp(DC_CITY_RE.source, 'u');
+const LEADING_WASHINGTON_RE = /^washington(?![\p{L}\p{M}\p{N}])(?!\s+state(?![\p{L}\p{M}\p{N}]))/u;
+const hintWithoutDcCity = (hint, display) => (typeof display === 'string' && DC_CITY_TEST_RE.test(display)
+  ? hint.replace(LEADING_WASHINGTON_RE, 'district of columbia')
+  : hint);
+
+function compileLocationKeywordList(value, { stateNameSkipsDc = false } = {}) {
   // An entry written as two uppercase letters ("IN", "DE") is an ISO country
   // code. Lowercased like every other keyword it would match the plain word
   // "in" in "Anywhere in the World" (#6605), so it is matched against the
@@ -536,6 +569,12 @@ function compileLocationKeywordList(value) {
     .filter(k => typeof k === 'string' && k.trim())
     .map((entry) => {
       const trimmed = foldLocationWhitespace(entry).trim();
+      if (DC_ENTRY_RE.test(trimmed)) return (lower) => DC_LOCATION_RE.test(lower);
+      if (stateNameSkipsDc && trimmed.toLowerCase() === 'washington') {
+        const state = compileLocationKeyword('washington');
+        // `display` is passed only when `lower` is the URL hint.
+        return (lower, _original, display) => state(withoutDcCity(hintWithoutDcCity(lower, display)));
+      }
       if (!/^[A-Z]{2}$/.test(trimmed)) return compileLocationKeyword(trimmed.toLowerCase());
       const re = new RegExp(`(?<![\\p{L}\\p{M}\\p{N}])${trimmed}(?![\\p{L}\\p{M}\\p{N}])`, 'u');
       return (lower, original) => typeof original === 'string' && re.test(original);
@@ -743,13 +782,17 @@ const WORLDWIDE_LOCATION_LABELS = new Set([
   'remote (worldwide)',
 ]);
 
+const GENERIC_REMOTE_ALLOW = new Set(['remote', 'remote work', 'work from home', 'anywhere', 'distributed']);
+const US_STATE_NAMES = new Set(USPS_STATES.map(([name]) => name).filter(name => !US_STATE_NAMES_ALSO_COUNTRIES.has(name)));
+const US_STATE_NAME_MATCHERS = [...US_STATE_NAMES].map(compileLocationKeyword);
+
 // `url` and `title` are optional. Callers that omit them get the original
 // location-only semantics, which is what the existing unit tests exercise.
 export function buildLocationFilter(locationFilter) {
   if (!locationFilter) return () => true;
   const workplacePolicy = buildWorkplacePolicy(locationFilter.workplace_policy);
   const alwaysAllowKeywords = normalizeKeywordList(locationFilter.always_allow).map(foldLocationWhitespace);
-  const alwaysAllow = compileLocationKeywordList(locationFilter.always_allow);
+  const alwaysAllow = compileLocationKeywordList(locationFilter.always_allow, { stateNameSkipsDc: true });
   // US-targeted configs list the country in always_allow and foreign cities
   // in block. "Dublin, OH" does not contain "United States", so without this
   // expansion block: [Dublin] rejects a real US job. Opt-in on the country
@@ -759,7 +802,7 @@ export function buildLocationFilter(locationFilter) {
     alwaysAllow.push(...US_STATE_ALWAYS_ALLOW_MATCHERS);
   }
   const allowKeywords = normalizeKeywordList(locationFilter.allow).map(foldLocationWhitespace);
-  const allow = compileLocationKeywordList(locationFilter.allow);
+  const allow = compileLocationKeywordList(locationFilter.allow, { stateNameSkipsDc: true });
   // Do not widen city-only or mixed city/country targeting. Reuse the shared
   // country vocabulary rather than introducing a second country-name list.
   const countryOnlyAllow = allowKeywords.length > 0
@@ -769,6 +812,14 @@ export function buildLocationFilter(locationFilter) {
   if (usExpansion && allow.length > 0) {
     allow.push(...US_STATE_ALLOW_MATCHERS);
   }
+  // A bare work-arrangement token says nothing about where the role is. When
+  // the lists also name a home country, it cannot admit a location that names
+  // only other places ("Remote (Hong Kong)" for a US list). With no home
+  // country to read, matching is unchanged.
+  const genericRemoteAllow = new Set(allow.filter((_, i) => GENERIC_REMOTE_ALLOW.has(allowKeywords[i])));
+  const homeCountries = genericRemoteAllow.size > 0 ? homeCountryCodes([...alwaysAllowKeywords, ...allowKeywords], US_STATE_NAMES) : new Set();
+  // The URL hint can name a place the display string leaves out ("Remote").
+  const outsideHome = (original, hint) => namesPlaceOutsideHome(hint ? `${original}; ${hint}` : original, homeCountries, segment => US_STATE_NAME_MATCHERS.some(m => m(segment)));
   const block = compileLocationKeywordList(locationFilter.block);
   const blockHard = compileLocationKeywordList(locationFilter.block_hard);
   // Opt-in: fail closed when there is nothing to judge on. Only meaningful when
@@ -787,7 +838,7 @@ export function buildLocationFilter(locationFilter) {
     // against a provider that never returns a location would otherwise let
     // every out-of-region posting through (#3276).
     if (lower === '' && hint === '') return !strict;
-    const matches = (m) => (lower !== '' && m(lower, original)) || (hint !== '' && m(hint));
+    const matches = (m) => (lower !== '' && m(lower, original)) || (hint !== '' && m(hint, undefined, lower));
     // `block_hard` is the ONE tier always_allow cannot override. It exists because
     // a European city name can be a whole word inside a non-European location, so
     // word-boundary matching (#2087) does not catch it and always_allow's
@@ -809,11 +860,15 @@ export function buildLocationFilter(locationFilter) {
     if (alwaysAllow.length > 0 && alwaysAllow.some(matches)) return true;
     if (block.length > 0 && block.some(matches)) return false;
     if (allow.length === 0) return true;
-    if (allow.some(matches)) return true;
+    const allowHits = allow.filter(matches);
+    if (allowHits.some(m => !genericRemoteAllow.has(m))) return true;
+    if (allowHits.length > 0) return !outsideHome(original, hint);
     if (!strict && countryOnlyAllow && WORLDWIDE_LOCATION_LABELS.has(lower)) return true;
     // Last resort only. Deliberately placed AFTER `block` so a remote title can
     // never rescue a blocked location — "Program Manager - Remote" in Bengaluru
     // stays rejected. This widens `allow`, never `block`.
+    // Nor can a remote title admit a place outside the home countries.
+    if (outsideHome(original, hint)) return false;
     return locationFilter.remote_title_fallback !== false && titleSignalsRemote(title);
   };
   // Detail readers may recheck this opt-in policy without repeating legacy
@@ -1373,6 +1428,42 @@ export function buildVisaFilter(visaFilter) {
     if (!requireMention) return true;
     if (positive.length === 0) return true;
     return positive.some(k => lower.includes(k));
+  };
+}
+
+// ── Employment-type filter ──────────────────────────────────────────
+// Optional. If `employment_type_filter` is absent from portals.yml, all jobs
+// pass, byte-identical to before the filter existed.
+//
+// Reads the structured `job.employmentType` a provider sets from the source's
+// own field (providers/_employment-type.mjs; today Himalayas, We Work Remotely,
+// Remotive, Ashby and Lever), never the title or description. A local parser
+// may emit a raw label ("Contractor"); it is normalized here the same way.
+//
+// Semantics:
+//   - a type in `allow` → pass
+//   - a type not in `allow` → reject
+//   - no type (the source doesn't say, or says something unrecognized) → pass,
+//     unless `include_unknown: false`. Most providers expose no type at all,
+//     so dropping unknowns by default would silently empty every such board.
+//
+// Config shape (portals.yml), parsed once by parseEmploymentTypeFilterConfig():
+//   employment_type_filter:
+//     allow: [contract, part_time]
+//     include_unknown: true   # default
+
+/**
+ * Build the employment_type_filter predicate.
+ * @param {unknown} block - portals.yml `employment_type_filter`.
+ * @returns {(employmentType: unknown) => boolean} true when the job passes.
+ * @throws {Error} when the block is malformed (see parseEmploymentTypeFilterConfig).
+ */
+export function buildEmploymentTypeFilter(block) {
+  const cfg = parseEmploymentTypeFilterConfig(block);
+  if (!cfg) return () => true;
+  return (employmentType) => {
+    const type = normalizeEmploymentType(employmentType);
+    return type ? cfg.allow.has(type) : cfg.includeUnknown;
   };
 }
 
@@ -2100,6 +2191,7 @@ export function normalizeUrlForDedup(url) {
     }
   }
   promoteKnownFragmentIdentity(parsed);
+  canonicalizeKnownPostingUrl(parsed);
   parsed.hash = '';
   parsed.pathname = parsed.pathname.replace(/\/+$/, '').toLowerCase() || '/';
   return parsed.toString();
@@ -2687,6 +2779,7 @@ const ROLE_LOCATION_SUFFIXES = new Set([
   'canada',
   'chicago',
   'copenhagen',
+  'distributed',
   'dublin',
   'emea',
   'eu',
@@ -2697,6 +2790,7 @@ const ROLE_LOCATION_SUFFIXES = new Set([
   'germany',
   'hamburg',
   'helsinki',
+  'hybrid',
   'india',
   'ireland',
   'italy',
@@ -2736,10 +2830,14 @@ const ROLE_LOCATION_SUFFIXES = new Set([
   'united kingdom',
   'united states',
   'us',
+  'u s',
   'usa',
+  'u s a',
   'vancouver',
   'vienna',
   'warsaw',
+  'wfh',
+  'work from home',
   'zurich',
 ]);
 
@@ -2853,6 +2951,16 @@ export function normalizeRoleForDedup(role) {
       title = title.slice(0, piped.index).trimEnd();
       continue;
     }
+    // "Engineer - Remote", "Engineer, Remote", and
+    // "Engineer - Platform - Remote". The last separated dash or comma is
+    // the delimiter, so a team tag in front of Remote stays. A hyphen inside
+    // the suffix stays too ("On-site", "Work-from-home"). "Engineer - Platform"
+    // is not a workplace tag.
+    const trailed = title.match(/^(.*)\s*[-–—,]\s+([^,|–—]+)\s*$/);
+    if (trailed && isRoleLocationSuffix(trailed[2])) {
+      title = trailed[1].trimEnd();
+      continue;
+    }
     break;
   }
   // Unicode-aware (#2393 family): the [a-z0-9] strip this used to carry keyed
@@ -2963,10 +3071,23 @@ export function companyRoleDedupKey(company, role, canonicalize = defaultCompany
 
 /**
  * Marker for a seeded company+role row whose requisition is unknown (in the
- * language sets: whose language is unknown). A single such row keeps the key a
- * plain duplicate, exactly as if neither signal were read at all.
+ * language sets: whose language is unknown). It means this row named none, not
+ * that every id was seen. A later posting that names an id is a different
+ * opening. A later posting that also names none stays a duplicate.
  */
 export const ANY_REQUISITION = '*';
+
+/**
+ * Marker for a seeded pipeline row whose posting scan-history never recorded.
+ * The scanner writes pipeline.md first and scan-history second, and the
+ * requisition id lives only in scan-history. When only the pipeline write
+ * landed, the row's id is lost, not absent: it may have been a provider-only
+ * id such as `JR100`. Such a row keeps the duplicate, as an unknown row did
+ * before, so a new URL for the same requisition cannot come back through it.
+ * A row whose scan-history entry exists but names no id is still
+ * {@link ANY_REQUISITION}.
+ */
+export const UNRECORDED_REQUISITION = '?';
 
 /**
  * Canonical requisition IDs for company+role dedupe — every form the source
@@ -2986,13 +3107,17 @@ export const ANY_REQUISITION = '*';
  *   from the file. Forms read from a URL or from text must contain a digit;
  * - a Workday URL, via `workdayDedupKey` (the same parse the provider uses for
  *   cross-site dedupe, #3439, including its `-N` repost-suffix stripping);
+ * - a Google Careers URL, via `googleCareersJobId` (url-key.mjs): the job id in
+ *   the path is Google's only identifier for an opening, so it is read the way
+ *   a Workday id is;
  * - labelled free text (tracker Notes, a posting title) via the tracker's own
  *   `extractReqNumber`, the vocabulary merge-tracker.mjs already relies on to
  *   keep same-title rows apart (#1524).
  *
  * Only these explicit forms count. A generic board's numeric posting ID is not
  * read: a repost gets a new one, and treating it as a requisition would disable
- * the company+role key it is layered on.
+ * the company+role key it is layered on. Google is the exception because its id
+ * is the only thing that tells two same-titled openings in one city apart.
  *
  * A labelled ID with a trailing `-N` is ambiguous. On Workday the suffix is a
  * cross-site repost disambiguator and `JR25919-1` IS JR25919 (the URL path
@@ -3028,9 +3153,18 @@ export const ANY_REQUISITION = '*';
  * @returns {string[]} Canonical requisition IDs, as-labelled form first.
  */
 export function requisitionIdsForDedup({ url, text, requisitionId } = {}) {
-  const suppliedId = typeof requisitionId === 'string' ? requisitionId.trim() : '';
+  const trimmedId = typeof requisitionId === 'string' ? requisitionId.trim() : '';
+  // `*` and `?` are the seed markers (ANY_REQUISITION, UNRECORDED_REQUISITION),
+  // not requisition IDs.
+  const suppliedId = trimmedId === ANY_REQUISITION || trimmedId === UNRECORDED_REQUISITION ? '' : trimmedId;
   const workdayKey = !suppliedId && typeof url === 'string' ? workdayDedupKey({ url }) : null;
   if (suppliedId) return [normalizeScanScalar(suppliedId).toUpperCase()];
+  // Google Careers has no requisition field: the job id in the URL path is the
+  // posting's only identifier. Without it a second Google opening with the same
+  // title and city (another team, or a re-listing under a new id) matched the
+  // first one's company+role key and was dropped as a duplicate for good.
+  const googleId = googleCareersJobId(url);
+  if (googleId) return [googleId];
   let raws;
   if (workdayKey) {
     // `workday:{hostname}:{reqId}` — a hostname has no colon, so the ID is
@@ -3075,19 +3209,28 @@ export function requisitionIdForDedup(source) {
  * Whether a candidate that matched a seen company+role key is nevertheless a
  * different requisition.
  *
- * True only when every seeded row for the key named its requisition and none of
- * the candidate's forms was seen. Any unknown on either side keeps the
- * historical answer — a duplicate — so the check can only let through postings
- * the company itself labelled as distinct. An ambiguous source contributes
- * every form it could mean (see {@link requisitionIdsForDedup}), and one hit
- * on any of them is a duplicate.
+ * True when the candidate names an id and no seeded row named that id. A seed
+ * that named none does not count as a match, so the labelled posting comes
+ * back, including when the seed is an Applied row. False when the candidate
+ * names no id, when a seeded row named one of its forms, when a seeded
+ * pipeline row lost its id ({@link UNRECORDED_REQUISITION}), or when there is
+ * no seed. An ambiguous source contributes every form it could mean (see
+ * {@link requisitionIdsForDedup}), and one hit on any of them is a duplicate.
  *
  * @param {Set<string>|undefined} seededRequisitions - Requisitions seen for matching keys.
  * @param {string[]|string|null} candidateRequisitions - From {@link requisitionIdsForDedup}.
  * @returns {boolean}
  */
 export function isDistinctRequisition(seededRequisitions, candidateRequisitions) {
-  return unseenOnEveryRow(seededRequisitions, candidateRequisitions);
+  const forms = toRequisitionForms(candidateRequisitions);
+  // A row that names no requisition is still the same opening. A row that
+  // names one is a different opening when the seed named none: the `*` marker
+  // means "unknown", not "every id".
+  if (!(seededRequisitions instanceof Set) || seededRequisitions.size === 0 || forms.length === 0) return false;
+  if (seededRequisitions.has(UNRECORDED_REQUISITION)) return false;
+  const named = [...seededRequisitions].filter((form) => form !== ANY_REQUISITION);
+  if (named.length === 0) return true;
+  return forms.every((form) => !seededRequisitions.has(form));
 }
 
 /**
@@ -3184,7 +3327,9 @@ function recordForms(formsByKey, key, forms) {
 function recordLanguages(languagesByKey, key, requisitions, languages) {
   let byRequisition = languagesByKey.get(key);
   if (!byRequisition) languagesByKey.set(key, (byRequisition = new Map()));
-  const list = toRequisitionForms(requisitions);
+  // A row that lost its requisition is filed with the unknown ones here; only
+  // the requisition check reads UNRECORDED_REQUISITION.
+  const list = toRequisitionForms(requisitions).filter((form) => form !== UNRECORDED_REQUISITION);
   for (const requisition of list.length > 0 ? list : [ANY_REQUISITION]) {
     recordForms(byRequisition, requisition, languages);
   }
@@ -3241,7 +3386,10 @@ function recordLanguages(languagesByKey, key, requisitions, languages) {
  * Requisition id and language are recorded per posting URL in scan-history
  * (`requisition_id`, `language`). A tracker or pipeline row carries neither, so
  * it inherits them from the scan-history row with the same URL; a row whose URL
- * scan-history never recorded them for stays unknown.
+ * scan-history never recorded them for stays unknown. A pipeline row whose URL
+ * scan-history has no row for at all, and whose URL names no id itself, is
+ * seeded as {@link UNRECORDED_REQUISITION}: its history write never landed, so
+ * the id it may have had is missing rather than absent.
  * @returns {Set<string>} Existing company+role dedupe keys.
  */
 export function collectSeenCompanyRoles(sources = {}, policy = {}, canonicalize = defaultCompanyNormalizer, { includeLocation = false, locatedBases = null, requisitionsByBase = null, locatedRequisitionsByBase = null, languagesByBase = null, locatedLanguagesByBase = null } = {}) {
@@ -3319,6 +3467,21 @@ export function collectSeenCompanyRoles(sources = {}, policy = {}, canonicalize 
       languageFormsForDedup(row.language));
   }
 
+  // An `added` row is the history write for the posting that entered the
+  // pipeline. A skipped or other observational row for the same URL is an
+  // earlier sighting, not proof that this write landed. Counting it left the
+  // pipeline row with no marker, so a later URL for the same id looked new.
+  let recordedUrls = null;
+  const recordedInHistory = (url) => {
+    if (!recordedUrls) {
+      recordedUrls = new Set();
+      for (const row of scanHistoryRows(scanHistoryText, historyRows)) {
+        if (row.url && (row.status || 'added') === 'added') recordedUrls.add(seenJobKey(row.url.trim()));
+      }
+    }
+    return recordedUrls.has(seenJobKey(url.trim()));
+  };
+
   // pipeline.md — company/title are the two cells after the URL cell, plus
   // optional trailing columns (location, compensation, posted:/trust:/note:
   // segments). The URL is not always first, and expired/pre-screen shapes
@@ -3329,8 +3492,11 @@ export function collectSeenCompanyRoles(sources = {}, policy = {}, canonicalize 
     const pair = extractPipelineCompanyRole(line);
     if (!pair) continue;
     const attributes = attributesFor(pair.url);
-    add(pair.company, pair.role, pair.location,
-      requisitionIdsForDedup({ url: pair.url, requisitionId: attributes.requisitionId }),
+    let requisition = requisitionIdsForDedup({ url: pair.url, requisitionId: attributes.requisitionId });
+    if (requisition.length === 0 && typeof pair.url === 'string' && pair.url && !recordedInHistory(pair.url)) {
+      requisition = [UNRECORDED_REQUISITION];
+    }
+    add(pair.company, pair.role, pair.location, requisition,
       languageFormsForDedup(attributes.language));
   }
 
@@ -3569,6 +3735,9 @@ export function formatScanHistoryRow(offer, date, status = 'added') {
     language: typeof offer.language === 'string' ? offer.language : '',
     listing_key: typeof offer.listingKey === 'string' ? offer.listingKey : '',
     closes_at: closesAtIso(offer.closesAt) || closesAtIso(offer),
+    // Job.employmentType, normalized again so a local parser's raw label
+    // ("Contractor") is stored the way a provider's is; '' when unknown.
+    employment_type: normalizeEmploymentType(offer.employmentType) ?? '',
   };
   return SCAN_HISTORY_COLUMNS.map((name) => sanitizeTsvField(record[name])).join('\t');
 }
@@ -4449,7 +4618,7 @@ export function progressTicker(total, { every = PROGRESS_EVERY, write = (line) =
 
 export async function verifyOffers(offers, { headedFallback = false, throttleBaseMs = 0, rediscover = false } = {}, {
   checkApi = checkLivenessViaApi,
-  loadPlaywright = () => import('playwright'),
+  loadPlaywright = () => import('./lib/hardened-chromium.mjs'),
   // Consulted before each headed retry (#5776); see robots-check.mjs.
   robotsGate = robotsAllows,
 } = {}) {
@@ -4682,7 +4851,7 @@ export function printBoardStats(stats, { verify = false } = {}) {
       console.log(`  ${name}: ${Object.entries(st.sourceDetail).map(([reason, n]) => `${reason} ${n}`).join(', ')}`);
     }
   }
-  console.log('  other = tier, declared field, salary, content, country, visa, cooldown and blacklist; seen = already in your history');
+  console.log('  other = tier, declared field, salary, employment type, content, country, visa, cooldown and blacklist; seen = already in your history');
 }
 
 const VALUE_FLAGS = ['--company', '--posted-after', '--posted-before', '--since'];
@@ -4695,6 +4864,7 @@ const USAGE = `Usage:
   node scan.mjs --verify --headed-fallback   # retry anti-bot-blocked URLs in a headed browser (needs a display)
   node scan.mjs --verify --throttle          # jittered ~5-10s gap between browser checks
   node scan.mjs --verify --throttle=8000     # custom base gap in ms (waits base..2*base)
+  node scan.mjs --verify --throttle 8000     # same gap, value as the next argument
   node scan.mjs --rediscover-404             # re-verify tracked URLs that 404/410 (rides on --verify)
   node scan.mjs --include-blacklisted        # let data/blacklist.md matches through (annotated)
   node scan.mjs --since 7                    # postings from the last 7 days
@@ -4706,6 +4876,32 @@ const USAGE = `Usage:
 
 Exit status: 0 when the scan ran, 1 on a configuration or fatal error, 2 when
 every target it tried failed (with --json: when any target failed).`;
+
+// --throttle stays out of VALUE_FLAGS. An equals form that is not a positive
+// integer has to remain an unrecognized flag, which is what the existing
+// throttle test locks. The space form is read here, after that check.
+export function readThrottleBaseMs(args) {
+  const eq = args.find((a) => typeof a === 'string' && a.startsWith('--throttle='));
+  if (eq && /^--throttle=0*[1-9]\d*$/.test(eq)) {
+    const raw = eq.slice('--throttle='.length);
+    const n = Number(raw);
+    if (Number.isSafeInteger(n) && n > 0) return { ms: n, consumedIndex: null };
+    // A digit string that does not fit a safe integer used to fall through and
+    // return ms: 0, which turns the pause off. The flag was present.
+    return { error: `Error: --throttle expects a positive number of milliseconds, got "${raw}"` };
+  }
+  const idx = args.indexOf('--throttle');
+  if (idx === -1) return { ms: 0, consumedIndex: null };
+  const next = args[idx + 1];
+  if (next === undefined || (typeof next === 'string' && next.startsWith('-'))) {
+    return { ms: 5000, consumedIndex: null };
+  }
+  if (typeof next === 'string' && /^0*[1-9]\d*$/.test(next)) {
+    const n = Number(next);
+    if (Number.isSafeInteger(n) && n > 0) return { ms: n, consumedIndex: idx + 1 };
+  }
+  return { error: `Error: --throttle expects a positive number of milliseconds, got "${next}"` };
+}
 
 async function main() {
   const args = process.argv.slice(2);
@@ -4722,11 +4918,26 @@ async function main() {
   // URL in a headed browser. Off by default — headed Chromium needs a display, so
   // scheduled/unattended scans should not rely on it.
   const headedFallback = args.includes('--headed-fallback');
-  // --throttle or --throttle=<ms>: jittered gap between --verify checks to stay
-  // under rate-based WAF limits (pracuj.pl flags the session after a few rapid
-  // hits). Default base 5000ms. Off by default — most ATS feeds don't need it.
-  const throttleArg = args.find((a) => a === '--throttle' || a.startsWith('--throttle='));
-  const throttleBaseMs = throttleArg ? (Number(throttleArg.split('=')[1]) || 5000) : 0;
+  // --throttle or --throttle=<ms> or --throttle <ms>: jittered gap between
+  // --verify checks. Bare flag is 5000ms. Off when the flag is absent.
+  const throttle = readThrottleBaseMs(args);
+  if (throttle.error) {
+    console.error(throttle.error);
+    process.exit(1);
+  }
+  const throttleBaseMs = throttle.ms;
+  const consumed = new Set();
+  if (throttle.consumedIndex != null) consumed.add(throttle.consumedIndex);
+  args.forEach((token, idx) => {
+    if (!VALUE_FLAGS.includes(token)) return;
+    const next = args[idx + 1];
+    if (typeof next === 'string' && !next.startsWith('-')) consumed.add(idx + 1);
+  });
+  const unexpected = args.find((token, idx) => !consumed.has(idx) && typeof token === 'string' && !token.startsWith('-'));
+  if (unexpected) {
+    console.error(`Error: unexpected argument "${unexpected}". Pass a company with --company, for example --company ${unexpected}.`);
+    process.exit(1);
+  }
   // --rediscover-404: when a tracked company's URL 404/410s, search for the
   // moved role and re-verify before marking it expired. Opt-in; rides on --verify.
   const rediscover = args.includes('--rediscover-404');
@@ -4853,6 +5064,15 @@ async function main() {
   // Derived by the same helper so the hint and the filter cannot disagree.
   const earlyStopSinceMs = resolveEarlyStopMs(effectiveAfter, config.max_posting_age_days);
   const salaryFilter = buildSalaryFilter(config.salary_filter);
+  // A malformed block exits here, before any network call: a typo in `allow`
+  // would otherwise drop every posting of the type it meant to keep.
+  let employmentTypeFilter;
+  try {
+    employmentTypeFilter = buildEmploymentTypeFilter(config.employment_type_filter);
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
   const workplaceFilter = buildWorkplaceFilter(config.workplace_filter);
   const trustValidator = buildTrustValidator(config.trust_filter);
   const contentFilter = buildContentFilterOrExit(config.content_filter);
@@ -5112,6 +5332,9 @@ async function main() {
   let totalFilteredPostingAge = 0;
   let totalFilteredPostedDate = 0;
   let totalFilteredSalary = 0;
+  // Summary line and receipt total only, like totalFilteredDeclaredField:
+  // scan-runs.tsv keeps its columns.
+  let totalFilteredEmploymentType = 0;
   let totalFilteredWorkplace = 0;
   let totalFilteredContent = 0;
   // #6020. Title misses that content_filter.rescue_title_misses kept on their
@@ -5420,6 +5643,12 @@ async function main() {
         }
         if (!workplaceFilter(job.workplaceType)) {
           totalFilteredWorkplace++;
+          st.other++;
+          continue;
+        }
+        if (!employmentTypeFilter(job.employmentType)) {
+          totalFilteredEmploymentType++;
+          st.other++;
           continue;
         }
         if (titleMissed) {
@@ -5832,6 +6061,9 @@ async function main() {
   if (config.salary_filter || totalFilteredSalary > 0) {
     console.log(`Filtered by salary:    ${totalFilteredSalary} removed`);
   }
+  if (config.employment_type_filter) {
+    console.log(`Filtered by employment type: ${totalFilteredEmploymentType} removed`);
+  }
   if (config.workplace_filter || totalFilteredWorkplace > 0) {
     console.log(`Filtered by workplace: ${totalFilteredWorkplace} removed`);
   }
@@ -6127,7 +6359,7 @@ async function main() {
   if (jsonMode) {
     const filtered = totalFilteredTitle + totalFilteredDeclaredField + totalFilteredTier + totalFilteredLocation
       + totalFilteredPostingAge + totalFilteredPostedDate + totalFilteredSalary + totalFilteredWorkplace
-      + totalFilteredContent + totalFilteredCountryEligibility + totalFilteredBlacklist
+      + totalFilteredEmploymentType + totalFilteredContent + totalFilteredCountryEligibility + totalFilteredBlacklist
       + totalFilteredVisa + totalFilteredCooldown;
     emitJsonReceipt({
       version: 'careerops.scan.receipt@1',
