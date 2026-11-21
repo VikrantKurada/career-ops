@@ -1,0 +1,161 @@
+%!TEX TS-program = pdflatex
+% career-ops-latex: dates=full
+\documentclass[{{PAPER}},11pt]{article}
+% The default template of `node ollama-runner.mjs tailor --latex`, and the
+% place to start a template pack: copy this file to
+% data/templates/<name>/cv-latex.tex and change the layout. docs/OLLAMA.md,
+% "Writing a template pack", describes the two header lines above, the
+% placeholders, the blocks and the macros.
+%
+% The renderer writes the text of the CV as calls to the eleven macros
+% defined below, one call per line, every value in them escaped. A template
+% decides how each one looks. It defines all eleven, and \cvStop prints
+% nothing.
+%
+% The fonts: T1 and Latin Modern under pdflatex, the engine named above. The
+% renderer writes < > | as they are, and the default OT1 encoding of
+% pdflatex prints other characters in their place. lmodern gives T1 its
+% Type 1 fonts, so the text layer of the PDF, which an applicant tracking
+% system reads, keeps every character. Under XeTeX, which xelatex and
+% tectonic run, fontspec and Latin Modern in OpenType: XeTeX has no glyph
+% past U+00FF in a T1 font, so it left out the en dash and the arrow, and it
+% looks a character up there at its Unicode code, so it printed U+00B1, the
+% plus-minus sign, as the s with an acute accent that T1 keeps in its place,
+% with nothing in the log.
+\ifdefined\XeTeXrevision
+  \usepackage{fontspec}
+\else
+  \usepackage[T1]{fontenc}
+  \usepackage{lmodern}
+\fi
+\usepackage[margin=2cm]{geometry}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+% The arrow U+2192 is written as it is too, and pdflatex has no glyph for it
+% until it is declared. Under XeTeX, Latin Modern in OpenType has one, and
+% \DeclareUnicodeCharacter is not defined.
+\ifdefined\DeclareUnicodeCharacter
+  \DeclareUnicodeCharacter{2192}{\ensuremath{\rightarrow}}
+\fi
+% The tilde is written \~{}, the one spelling the final text check reads as
+% a character. T1 prints that as the accent, which the text layer of the PDF
+% gives as U+02DC: a parser read a link or a "~40%" with the wrong
+% character. Declared as \textasciitilde it prints ~, and \~{n} is still an
+% n with a tilde. Under XeTeX the text is in TU, which prints \~{} as ~ by
+% itself: the declaration changes T1 alone, which the text does not use.
+\ifcsname T1\string\~\endcsname
+  \makeatletter
+  \DeclareTextCompositeCommand{\~}{T1}{\@empty}{\textasciitilde}
+  \makeatother
+\fi
+\hypersetup{pdfauthor={{{FIRST_NAME}} {{LAST_NAME}}}, pdfsubject={Curriculum vitae, {{DATE}}}}
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\raggedright
+\setlist[itemize]{leftmargin=1.2em, itemsep=1pt, parsep=0pt, topsep=2pt, partopsep=0pt}
+
+% #1 is empty: #2; else #3. The renderer writes an empty value as {}.
+\newcommand{\cvIfEmpty}[3]{\if\relax\detokenize{#1}\relax #2\else #3\fi}
+% A heading. In the body \cvStop{.} follows each one, for the reason given
+% at \cvStop.
+\newcommand{\cvSection}[1]{\par\vspace{10pt}{\large\bfseries #1}\par\vspace{2pt}\hrule\vspace{5pt}}
+% One item of the contact line, with a bar before each item but the first,
+% so a contact detail the profile does not give leaves no bar behind. An item
+% is kept whole: a long line breaks at a bar, not inside "San Francisco, CA".
+\newif\ifcvcontact
+\newcommand{\cvContact}[1]{\ifcvcontact\hspace{0.5em}\textbar\hspace{0.5em}\else\global\cvcontacttrue\fi\mbox{#1}}
+
+% The macros the renderer writes.
+%
+% Prints nothing. The renderer writes \cvStop{.} after each entry. The final
+% text check of generate-latex.mjs reads this file as text, and without the
+% full stop a list of tools after "using" ran on into the next bullet or the
+% next heading, and a CV true to cv.md was blocked.
+\newcommand{\cvStop}[1]{}
+% A paragraph of the summary.
+\newcommand{\cvSummary}[1]{#1\par\smallskip}
+% A job: role, company, location, dates. Its blocks follow it.
+\newcommand{\cvEntryHead}[4]{\par\textbf{#1}, #2\cvIfEmpty{#3}{}{, #3}\hfill #4\par}
+% A group of bullets under a job: a lead (a title for the group), an intro,
+% and the bullets.
+\newcommand{\cvEntryBlock}[3]{%
+  \cvIfEmpty{#1}{}{\par\textit{#1}\par}%
+  \cvIfEmpty{#2}{}{\par #2\par}%
+  \cvIfEmpty{#3}{}{\begin{itemize}#3\end{itemize}}}
+% A bullet. The {} keeps a bullet that opens with [ from being read as the
+% label of the item.
+\newcommand{\cvItem}[1]{\item {}#1}
+% Between two jobs, and between two entries of the education.
+\newcommand{\cvEntrySep}{\par\vspace{5pt}}
+% The projects: an intro, then the projects.
+\newcommand{\cvProjects}[2]{%
+  \cvIfEmpty{#1}{}{\par #1\par}%
+  \cvIfEmpty{#2}{}{\begin{itemize}#2\end{itemize}}}
+% A project: its name, its address or nothing, its text.
+\newcommand{\cvProject}[3]{\item {}\textbf{\cvIfEmpty{#2}{#1}{\href{#2}{#1}}}\cvIfEmpty{#3}{}{: #3}}
+% An entry of the education: degree, institution, dates.
+\newcommand{\cvEducation}[3]{\par\textbf{#1}, #2\hfill #3\par}
+% A certification, an item of the list the body opens for them.
+\newcommand{\cvCert}[1]{\item {}#1}
+% A line of skills: the category, without its colon, and the items.
+\newcommand{\cvSkill}[2]{\par\cvIfEmpty{#1}{}{\textbf{#1}: }#2\par}
+
+\begin{document}
+
+\begin{center}
+{\LARGE\bfseries {{NAME}}}\par
+%%IF TITLE
+\vspace{3pt}{\large {{TITLE}}}\par
+%%END TITLE
+\vspace{5pt}{\small
+%%IF LOCATION
+\cvContact{{{LOCATION}}}%
+%%END LOCATION
+%%IF EMAIL
+\cvContact{\href{{{EMAIL_URL}}}{{{EMAIL}}}}%
+%%END EMAIL
+%%IF PHONE
+\cvContact{{{PHONE}}}%
+%%END PHONE
+%%IF LINKEDIN
+\cvContact{\href{{{LINKEDIN_URL}}}{{{LINKEDIN_DISPLAY}}}}%
+%%END LINKEDIN
+%%IF GITHUB
+\cvContact{\href{{{GITHUB_URL}}}{{{GITHUB_DISPLAY}}}}%
+%%END GITHUB
+\par}
+\end{center}
+
+%%IF SUMMARY
+\cvSection{Summary}\cvStop{.}
+{{SUMMARY}}
+%%END SUMMARY
+
+%%IF EXPERIENCE
+\cvSection{Experience}\cvStop{.}
+{{EXPERIENCE}}
+%%END EXPERIENCE
+
+%%IF PROJECTS
+\cvSection{Projects}\cvStop{.}
+{{PROJECTS}}
+%%END PROJECTS
+
+%%IF EDUCATION
+\cvSection{Education}\cvStop{.}
+{{EDUCATION}}
+%%END EDUCATION
+
+%%IF CERTIFICATIONS
+\cvSection{Certifications}\cvStop{.}
+\begin{itemize}
+{{CERTIFICATIONS}}
+\end{itemize}
+%%END CERTIFICATIONS
+
+%%IF SKILLS
+\cvSection{Skills}\cvStop{.}
+{{SKILLS}}
+%%END SKILLS
+
+\end{document}

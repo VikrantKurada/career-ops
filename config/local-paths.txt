@@ -1,9 +1,10 @@
 # local-paths.txt: files this fork owns that upstream career-ops does not ship.
 #
 # Branch ollama-local adds a local Ollama backend (docs/OLLAMA.md). The first
-# four files below are that backend. The fifth is the rule that tells an agent
-# to sync this fork with git and not with the updater. Listing them here does
-# two things:
+# six files below are that backend: the runner, its four modules and the
+# default template of a CV in LaTeX. The seventh is the rule that tells an
+# agent to sync this fork with git and not with the updater. Listing them here
+# does two things:
 #   - `node update-system.mjs apply` (npm run update) treats them like cv.md and
 #     never writes to them;
 #   - `node validate-system-paths-coverage.mjs` stops reporting them as tracked
@@ -22,4 +23,6 @@ ollama-runner.mjs
 lib/ollama-config.mjs
 lib/ollama-client.mjs
 lib/ollama-doctor.mjs
+lib/ollama-cv-latex.mjs
+lib/ollama-cv-latex-default.tex
 .claude/rules/ollama-fork.md

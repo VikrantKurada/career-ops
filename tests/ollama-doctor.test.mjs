@@ -1494,7 +1494,10 @@ test('doctor --ollama: a run whose event loop stays open still ends, through the
 // tests/doctor-without-node-modules.test.mjs and
 // tests/claude-plugin-install.test.mjs build, and with the check imported at
 // the top of doctor.mjs both died there on ERR_MODULE_NOT_FOUND.
-const BACKEND_FILES = ['ollama-runner.mjs', 'lib/ollama-config.mjs', 'lib/ollama-client.mjs', 'lib/ollama-doctor.mjs'];
+const BACKEND_FILES = [
+  'ollama-runner.mjs', 'lib/ollama-config.mjs', 'lib/ollama-client.mjs', 'lib/ollama-doctor.mjs', 'lib/ollama-cv-latex.mjs',
+  'lib/ollama-cv-latex-default.tex',
+];
 
 /**
  * A copy of what the checkout ships, without the backend, and with the

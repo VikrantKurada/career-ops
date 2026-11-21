@@ -13,7 +13,7 @@
 //   - A merge of upstream/main resolved the wrong way drops the same hunks, or
 //     leaves upstream's `ollama:eval` line beside the fork's.
 //   - config/local-paths.txt is what keeps validate-system-paths-coverage.mjs
-//     green for the four backend files and the agent rule, and makes the
+//     green for the six backend files and the agent rule, and makes the
 //     updater stop if a release ever ships a file of the same name (it ships
 //     none today, so it does not write to them either way). It only reaches a
 //     clone or CI because .gitignore un-ignores it, and that negation only
@@ -70,6 +70,8 @@ const BACKEND_FILES = [
   'lib/ollama-config.mjs',
   'lib/ollama-client.mjs',
   'lib/ollama-doctor.mjs',
+  'lib/ollama-cv-latex.mjs',
+  'lib/ollama-cv-latex-default.tex',
 ];
 
 // The fork's rule for agents. Claude Code loads every rule under
@@ -214,7 +216,7 @@ test('the script every ollama npm command starts exists', () => {
   assert.ok(existsSync(at('ollama-runner.mjs')), 'ollama-runner.mjs is missing, so every `npm run ollama:*` fails');
 });
 
-test('config/local-paths.txt declares the four backend files and the agent rule', () => {
+test('config/local-paths.txt declares the six backend files and the agent rule', () => {
   const declared = declaredPaths();
   const missing = DECLARED_FILES.filter((file) => !declared.includes(file));
   assert.deepEqual(missing, [], `not declared in ${LOCAL_PATHS}: ${missing.join(', ')}. `
@@ -604,6 +606,69 @@ test('the messages docs/OLLAMA.md quotes are still the ones the code prints', ()
         'Could not release report reservation',
         'Could not save evaluation',
         '<!-- end of the archived job description -->',
+        // The CV in LaTeX: how its format is chosen and refused, what stops a
+        // run before the model is asked, what a blocked CV leaves behind, and
+        // what `pdf` says about a .json, a .tex and their compile. Pieces of a
+        // message cut where the code joins in a value.
+        '--latex cannot be used with --html: a CV is made in one format.',
+        '--template is for LaTeX CVs: add --latex, or set cv.output_format to latex in config/profile.yml.',
+        'needs --tailor or --pdf: it chooses the format of the tailored CV.',
+        'config/profile.yml has no candidate.full_name: the CV header needs it.',
+        'which a LaTeX CV has no section for. Remove it from the',
+        'list, or tailor with --html.',
+        'The fact check passes this CV with',
+        'The final text check did not run: cv.md was not found.',
+        'Next, the PDF: node ollama-runner.mjs pdf',
+        '--pdf cannot be used with --no-save: the PDF is compiled from the saved .tex.',
+        'The CV is kept for you to work on:',
+        'No .tex was written, and no PDF.',
+        'Run without --no-save to keep a blocked CV as its .json, for you to edit.',
+        'The check misread an escaped character: reword that line in the .json.',
+        'The check misread an escaped character: reword that line.',
+        'No tailored LaTeX CV for',
+        'cannot be used with a file: its extension names the format.',
+        '--template cannot be used with a .tex file: its first line names the template.',
+        '--format cannot be used with a .tex file: the paper size is written in it.',
+        'LaTeX file not found:',
+        'Fix the template or the .tex',
+        'pages; the allowed maximum is',
+        'The draft is kept:',
+        'The PDF lacks these characters, which the template\'s font does not have:',
+        'The build folder could not be removed:',
+        'The CV is kept:',
+        'Change the text in the .json and run pdf',
+        'on it: a .tex may change layout only.',
+        'pdf needs the payload of this .tex:',
+        'was not found beside it.',
+        'This .tex does not say which template it was made from: its first line must read',
+        '% career-ops-latex: template=<name>.',
+      ],
+    },
+    {
+      // What lib/ollama-cv-latex.mjs says about an engine, a template and
+      // the text written into one. The runner prints it as it is.
+      files: ['lib/ollama-cv-latex.mjs'],
+      quoted: [
+        'lualatex is not supported: it runs Lua code from the document. Use xelatex.',
+        '--version did not run. A template names its engine on the line',
+        '(pdflatex when it has none).',
+        'engine cannot print that character: replace it in the .json, or use a template for xelatex.',
+        'Templates here:',
+        'is not a placeholder of a LaTeX CV.',
+        'The CV text would run a LaTeX command the renderer does not write:',
+      ],
+    },
+    {
+      // The lines of the default template the guide tells the author of a
+      // template pack to copy, and the guide's section the template sends
+      // that author to by name.
+      files: ['lib/ollama-cv-latex-default.tex'],
+      quoted: [
+        'Writing a template pack',
+        String.raw`\newcommand{\cvStop}[1]{}`,
+        String.raw`\DeclareUnicodeCharacter{2192}{\ensuremath{\rightarrow}}`,
+        String.raw`\ifcsname T1\string\~\endcsname`,
+        String.raw`\DeclareTextCompositeCommand{\~}{T1}{\@empty}{\textasciitilde}`,
       ],
     },
     {

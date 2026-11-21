@@ -29,7 +29,7 @@
 // Run:  node --test tests/ollama-runner-steps.test.mjs
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import * as yaml from 'js-yaml';
 
@@ -43,8 +43,8 @@ import { readOllamaConfig } from '../lib/ollama-config.mjs';
 // mode appends to a report.
 import { upsertApplicationAnswersSection } from '../application-answers.mjs';
 import {
-  ROOT, RUNNER, TODAY, SANDBOX, JD, goodReply, CV_HTML, ANSWERS, applyMessage, REFUSAL, BLOCK_F, makeRoot,
-  writeReport, listing, read, asksFor, replies, withStub, cli, assertExit, trackerRow, PAGES, evaluationFor,
+  ROOT, RUNNER, TODAY, SANDBOX, JD, goodReply, CV_HTML, CV_PAYLOAD, ANSWERS, applyMessage, REFUSAL, BLOCK_F, makeRoot,
+  writeReport, listing, read, asksFor, replies, withStub, cli, assertExit, pdfIndex, trackerRow, PAGES, evaluationFor,
   makePipelineRoot, pendingUrls, fakeClient, quietUi,
 } from './helpers/ollama-runner-harness.mjs';
 
@@ -2390,5 +2390,192 @@ describe('command line', { concurrency: 6 }, () => {
     assert.match(parseArgs(['tailor', '003', '--format', 'a4']).error, /Unknown option: --format/);
     assert.match(parseArgs(['run', '--tailor']).error, /Unknown option: --tailor/);
     assert.match(parseArgs(['tailor', '003', '--jd']).error, /--jd needs a value/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pipeline and run with a LaTeX CV
+// ---------------------------------------------------------------------------
+//
+// The steps after an evaluation make the CV in the format the command line
+// or the profile chooses, and the PDF of a LaTeX CV is compiled, not rendered
+// by generate-pdf.mjs. No TeX engine runs: cli() puts a stand-in in place of
+// the compile (tests/helpers/ollama-runner-harness.mjs, SEAM_DRIVER). The
+// tracker is what is looked at last: its PDF column is ticked from the row
+// data/pdf-index.tsv gets for a compiled PDF, as for a rendered one.
+
+describe('pipeline and run with a LaTeX CV', { concurrency: 6 }, () => {
+  const PAYLOAD_REPLY = JSON.stringify(CV_PAYLOAD);
+
+  test('pipeline --pdf --latex makes a .json and a .tex for each posting that reaches --min-score, compiles each, and ticks the tracker', async () => {
+    const root = makePipelineRoot();
+    await withStub({ reply: replies({ evaluate: (seen) => evaluationFor(seen), tailor: PAYLOAD_REPLY }) }, async (stub) => {
+      const run = await cli(['pipeline', '--pdf', '--latex', '--json', '--url', stub.url], { root, pages: PAGES, compile: { pages: 1 } });
+      assertExit(run, 0);
+      const receipt = JSON.parse(run.stdout);
+      assert.deepEqual([receipt.success, receipt.merged, receipt.pending], [true, true, 0]);
+      const steps = Object.fromEntries(receipt.done.map((entry) => [entry.company, entry.steps]));
+      const cv = (num, slug) => `output/cv-jane-smith-${num}-${slug}-${TODAY}`;
+      for (const [company, num, slug] of [['Acme', '001', 'acme'], ['Initech', '003', 'initech']]) {
+        assert.deepEqual(steps[company].map(({ step, success, path, format }) => [step, success, path, format]), [
+          ['tailor', true, `${cv(num, slug)}.tex`, 'latex'],
+          ['pdf', true, `${cv(num, slug)}.pdf`, undefined],
+        ], company);
+        assert.equal(steps[company][1].factWarnings, 0, company);
+      }
+      assert.equal(steps.Globex, undefined, 'a 3.1 is below the default threshold of 4.0');
+      // The engine is asked before each CV is asked for, and each .tex is compiled once.
+      assert.deepEqual(stub.generations().map(asksFor), ['evaluate', 'tailor', 'evaluate', 'evaluate', 'tailor']);
+      assert.deepEqual(run.compiled.map(({ call }) => call), ['version', 'compile', 'version', 'compile']);
+      assert.deepEqual(listing(join(root, 'output')), [
+        `cv-jane-smith-001-acme-${TODAY}.json`, `cv-jane-smith-001-acme-${TODAY}.pdf`, `cv-jane-smith-001-acme-${TODAY}.tex`,
+        `cv-jane-smith-003-initech-${TODAY}.json`, `cv-jane-smith-003-initech-${TODAY}.pdf`, `cv-jane-smith-003-initech-${TODAY}.tex`,
+      ]);
+      assert.deepEqual(pdfIndex(root), [
+        ['001', `${cv('001', 'acme')}.pdf`, '', 'letter', TODAY, 'cv'],
+        ['003', `${cv('003', 'initech')}.pdf`, '', 'letter', TODAY, 'cv'],
+      ]);
+      // The merge comes after the PDFs, so it ticks the rows that have one.
+      assert.deepEqual(['Acme', 'Globex', 'Initech'].map((company) => trackerRow(root, company)[6]), ['✅', '❌', '✅']);
+    });
+  });
+
+  test('run with cv.output_format: latex in the profile makes the CV in LaTeX, compiles it, drafts the answers and ticks the tracker', async () => {
+    const root = makeRoot();
+    writeFileSync(join(root, 'config', 'profile.yml'), read(root, 'config', 'profile.yml').replace('output_format: "html"', 'output_format: "latex"'));
+    assert.match(read(root, 'config', 'profile.yml'), /output_format: "latex"/, 'the example profile no longer sets cv.output_format');
+    const stem = `001-northwind-robotics-${TODAY}`;
+    await withStub({ reply: replies({ tailor: PAYLOAD_REPLY }) }, async (stub) => {
+      const run = await cli(['run', '--file', join(root, 'jd.txt'), '--quiet', '--url', stub.url], { root, compile: { pages: 1 } });
+      assertExit(run, 0);
+      assert.deepEqual(stub.generations().map(asksFor), ['evaluate', 'tailor', 'apply']);
+      assert.deepEqual(listing(join(root, 'output')), [
+        `apply-${stem}.md`, `cv-jane-smith-${stem}.json`, `cv-jane-smith-${stem}.pdf`, `cv-jane-smith-${stem}.tex`,
+      ]);
+      assert.deepEqual(run.compiled.map(({ call, engine }) => `${call} ${engine}`), ['version pdflatex', 'compile pdflatex']);
+      assert.deepEqual(pdfIndex(root), [['001', `output/cv-jane-smith-${stem}.pdf`, '', 'letter', TODAY, 'cv']]);
+      assert.equal(trackerRow(root, 'Northwind Robotics')[6], '✅');
+      const summary = run.stdout.slice(run.stdout.indexOf('Run summary'));
+      assert.match(summary, /^\s+tailor\s+done\s+output\/cv-jane-smith-001-\S+\.tex$/m);
+      assert.match(summary, /^\s+pdf\s+done\s+output\/cv-jane-smith-001-\S+\.pdf$/m);
+      assert.match(summary, /^\s+apply\s+done\s+output\/apply-001-/m);
+      assert.doesNotMatch(run.stderr, /❌/);
+    });
+  });
+
+  test('a LaTeX CV that cannot be compiled fails its pdf step, and the run goes on to the answers', async () => {
+    const root = makeRoot();
+    const stem = `001-northwind-robotics-${TODAY}`;
+    await withStub({ reply: replies({ tailor: PAYLOAD_REPLY }) }, async (stub) => {
+      const run = await cli(['run', '--file', join(root, 'jd.txt'), '--latex', '--json', '--url', stub.url], { root, compile: { fail: 'COMPILE' } });
+      assertExit(run, 1);
+      const receipt = JSON.parse(run.stdout);
+      assert.deepEqual(receipt.steps.map((step) => [step.step, step.success, step.code]), [
+        ['tailor', true, undefined], ['pdf', false, 'LATEX'], ['apply', true, undefined],
+      ]);
+      assert.deepEqual(listing(join(root, 'output')), [`apply-${stem}.md`, `cv-jane-smith-${stem}.json`, `cv-jane-smith-${stem}.tex`]);
+      assert.equal(trackerRow(root, 'Northwind Robotics')[6], '❌');
+    });
+  });
+
+  test('--latex, --html or --template without a CV to make is refused before anything is sent, and so is --latex with --html', async () => {
+    const root = makePipelineRoot();
+    const SAME = 'needs --tailor or --pdf: it chooses the format of the tailored CV.';
+    const ONE_FORMAT = '--latex cannot be used with --html: a CV is made in one format.';
+    const NOT_LATEX = '--template is for LaTeX CVs: add --latex, or set cv.output_format to latex in config/profile.yml.';
+    await withStub({}, async (stub) => {
+      for (const [args, reason] of [
+        [['pipeline', '--latex'], `--latex ${SAME}`],
+        [['pipeline', '--html'], `--html ${SAME}`],
+        [['pipeline', '--template', 'default'], `--template ${SAME}`],
+        [['pipeline', '--tailor', '--latex', '--html'], ONE_FORMAT],
+        [['pipeline', '--pdf', '--template', 'default'], NOT_LATEX],
+        [['run', '--file', join(root, 'jd.txt'), '--latex', '--html'], ONE_FORMAT],
+        [['run', '--file', join(root, 'jd.txt'), '--template', 'default'], NOT_LATEX],
+      ]) {
+        const run = await cli([...args, '--json', '--url', stub.url], { root, pages: PAGES });
+        assertExit(run, 1, args.join(' '));
+        assert.deepEqual(JSON.parse(run.stdout), { command: args[0], success: false, reason, code: 'USAGE' }, args.join(' '));
+        assert.ok(run.stderr.includes(`❌  ${reason}`), run.stderr);
+      }
+      assert.deepEqual(stub.requests, []);
+    });
+    assert.deepEqual(pendingUrls(root), Object.keys(PAGES));
+    assert.deepEqual(listing(join(root, 'reports')), []);
+  });
+
+  test('under cv.output_format: latex, the way past a report\'s advice that run --html and pipeline --html print makes HTML again', async () => {
+    // `tailor N --pdf` alone makes the CV in the profile's format, LaTeX here,
+    // and with --pdf asks for a TeX engine.
+    const latexProfile = (root) => {
+      writeFileSync(join(root, 'config', 'profile.yml'), read(root, 'config', 'profile.yml').replace('output_format: "html"', 'output_format: "latex"'));
+      assert.match(read(root, 'config', 'profile.yml'), /output_format: "latex"/, 'the example profile no longer sets cv.output_format');
+      return root;
+    };
+    const hint = 'To make the CV and the answers anyway: `node ollama-runner.mjs tailor 001 --pdf --html` and '
+      + '`node ollama-runner.mjs apply 001 --force`.';
+    const runRoot = latexProfile(makeRoot());
+    await withStub({ reply: replies({ evaluate: stoppedReply() }) }, async (stub) => {
+      const run = await cli(['run', '--file', join(runRoot, 'jd.txt'), '--html', '--quiet', '--url', stub.url], { root: runRoot });
+      assertExit(run, 0);
+      assert.ok(run.stderr.includes(hint), run.stderr);
+    });
+    const pipelineRoot = latexProfile(makePipelineRoot());
+    const evaluate = (seen) => evaluationFor(seen, { padding: { Acme: `\n${STOP_SUMMARY}\n` } });
+    await withStub({ reply: replies({ evaluate }) }, async (stub) => {
+      const run = await cli(['pipeline', '--pdf', '--html', '--one', '--quiet', '--no-merge', '--url', stub.url], { root: pipelineRoot, pages: PAGES });
+      assertExit(run, 0);
+      assert.ok(run.stderr.includes(`    ${hint}`), run.stderr);
+    });
+  });
+
+  test('the way past a report\'s advice names the template a run took with --template and the profile does not choose', async () => {
+    // `tailor N --pdf --latex` alone makes the CV in the profile's template.
+    const withPack = (root) => {
+      mkdirSync(join(root, 'data', 'templates', 'mine'), { recursive: true });
+      writeFileSync(join(root, 'data', 'templates', 'mine', 'cv-latex.tex'), readFileSync(join(ROOT, 'lib', 'ollama-cv-latex-default.tex'), 'utf-8'));
+      return root;
+    };
+    const hint = (flags) => `To make the CV and the answers anyway: \`node ollama-runner.mjs tailor 001 --pdf ${flags}\` and `
+      + '`node ollama-runner.mjs apply 001 --force`.';
+    const runRoot = withPack(makeRoot());
+    await withStub({ reply: replies({ evaluate: stoppedReply() }) }, async (stub) => {
+      const run = await cli(['run', '--file', join(runRoot, 'jd.txt'), '--latex', '--template', 'mine', '--quiet', '--url', stub.url], { root: runRoot });
+      assertExit(run, 0);
+      assert.ok(run.stderr.includes(hint('--latex --template mine')), run.stderr);
+    });
+    const pipelineRoot = withPack(makePipelineRoot());
+    const evaluate = (seen) => evaluationFor(seen, { padding: { Acme: `\n${STOP_SUMMARY}\n` } });
+    await withStub({ reply: replies({ evaluate }) }, async (stub) => {
+      const run = await cli(['pipeline', '--pdf', '--latex', '--template', 'mine', '--one', '--quiet', '--no-merge', '--url', stub.url],
+        { root: pipelineRoot, pages: PAGES });
+      assertExit(run, 0);
+      assert.ok(run.stderr.includes(`    ${hint('--latex --template mine')}`), run.stderr);
+    });
+    // A template the profile chooses is not named: `tailor` takes it from there.
+    const chosenRoot = withPack(makeRoot());
+    writeFileSync(join(chosenRoot, 'config', 'profile.yml'), read(chosenRoot, 'config', 'profile.yml')
+      .replace('output_format: "html"', 'latex_template: "mine"\n  output_format: "latex"'));
+    assert.match(read(chosenRoot, 'config', 'profile.yml'), /latex_template: "mine"/, 'the example profile no longer sets cv.output_format');
+    await withStub({ reply: replies({ evaluate: stoppedReply() }) }, async (stub) => {
+      const run = await cli(['run', '--file', join(chosenRoot, 'jd.txt'), '--quiet', '--url', stub.url], { root: chosenRoot });
+      assertExit(run, 0);
+      assert.ok(run.stderr.includes(hint('--latex')), run.stderr);
+    });
+  });
+
+  test('--help lists --latex, --html and --template for tailor, pdf, pipeline and run, and says pdf compiles a LaTeX CV', async () => {
+    const run = await cli(['--help'], { root: makeRoot() });
+    assertExit(run, 0);
+    for (const command of ['pipeline', 'tailor', 'pdf', 'run']) {
+      for (const flag of ['--latex', '--html', '--template']) {
+        assert.match(run.stdout, new RegExp(`^${command}:\\n(?: {2}--.*\\n)*? {2}${flag}\\b`, 'm'), `${command} ${flag}`);
+      }
+    }
+    const pdfLine = 'Render a tailored CV to PDF (an HTML CV with generate-pdf.mjs; a .tex or .json CV with a LaTeX engine); no model involved';
+    assert.ok(run.stdout.split('\n').some((line) => /^ {2}pdf <report \| file\.html> +/.test(line) && line.endsWith(` ${pdfLine}`)), run.stdout);
+    // The flags have no default, so a command line without them parses to no key and the profile decides.
+    assert.deepEqual(parseArgs(['pipeline', '--pdf', '--latex', '--template', 'plain']).flags, { pdf: true, latex: true, template: 'plain' });
+    assert.deepEqual(parseArgs(['pdf', 'output/cv.json', '--template', 'plain']).flags, { template: 'plain' });
   });
 });

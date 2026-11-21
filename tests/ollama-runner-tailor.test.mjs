@@ -34,15 +34,15 @@
 // Run:  node --test tests/ollama-runner-tailor.test.mjs
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import {
-  NO_TOOLS_NOTE, checkReading, pruneRejectedEntries, refusedMarkup, tailorCv, tailoredCvProblem, withoutUnsupportedLinks,
+  NO_TOOLS_NOTE, checkReading, pruneRejectedEntries, readCvFormat, refusedMarkup, tailorCv, tailoredCvProblem, withoutUnsupportedLinks,
 } from '../ollama-runner.mjs';
 import { readOllamaConfig } from '../lib/ollama-config.mjs';
 import {
-  ROOT, TODAY, SANDBOX, JD, tailoredCv, CV_HTML, CSP_META, asSaved, SAVED_CV, makeRoot, writeReport, listing, read,
+  ROOT, TODAY, SANDBOX, JD, tailoredCv, CV_HTML, CV_PAYLOAD, CSP_META, asSaved, SAVED_CV, makeRoot, writeReport, listing, read,
   asksFor, replies, withStub, cli, assertExit, makeTailoredRoot, pdfIndex, trackerRow, PAGES, evaluationFor,
   makePipelineRoot, fakeClient, quietUi, KEYWORDED_CV, WITHOUT_KEYWORDS, INFLATED_CV,
 } from './helpers/ollama-runner-harness.mjs';
@@ -2233,5 +2233,1478 @@ describe('pdf: what generate-pdf.mjs said', { concurrency: 6 }, () => {
       assert.match(run.stdout, /^\s+pdf\s+done\s+output\/\S+\.pdf \(\d+ fact-check warnings?\)$/m);
       assert.match(run.stdout, /^\s+apply\s+done\s+output\/apply-001-/m);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tailor --latex
+// ---------------------------------------------------------------------------
+//
+// The CV in LaTeX. The model is asked for the text of the CV as one JSON
+// object (lib/ollama-cv-latex.mjs) and never for a line of LaTeX: one `\input`
+// in a bullet would read a file into the PDF. The runner checks that text
+// where an HTML CV's text is checked, then writes the .json and the .tex a
+// template makes of it. What is held here is what reaches the model, which
+// files a run leaves and which it must not, and what is refused before the
+// model is asked anything. The PDF of such a CV is not made here.
+
+describe('tailor --latex', { concurrency: 6 }, () => {
+  const cfg = readOllamaConfig({});
+  const PAYLOAD_REPLY = JSON.stringify(CV_PAYLOAD, null, 2);
+  /** The persona's payload with `change` made to a copy of it, as a model sends it. */
+  const replyWith = (change) => {
+    const payload = structuredClone(CV_PAYLOAD);
+    change(payload);
+    return JSON.stringify(payload);
+  };
+  /** The two files a LaTeX run writes for a report of writeReport(), named after the candidate of the profile. */
+  const latexFiles = (report, slug = 'jane-smith') => ({ tex: `cv-${slug}-${report.stem}.tex`, json: `cv-${slug}-${report.stem}.json` });
+  /** A LaTeX tailoring run in this process, as tailorHere() runs one for HTML. */
+  const latexHere = async (root, { ref = '001', reply = PAYLOAD_REPLY, ...deps } = {}) => {
+    const { ui, written } = quietUi();
+    const client = fakeClient({ reply });
+    const result = await tailorCv(ref, { cfg, client, ui, dataRoot: root, format: 'latex', ...deps });
+    return { result, client, err: written.err, out: written.out };
+  };
+  /** TAILOR_GROUNDING_NOTE, word for word: the HTML request ends with it, and so does this one. */
+  const GROUNDING = 'Every tool, method, number and scope you write for a job or a project must be one that cv.md states for that '
+    + 'same job or project. Do not move a number or a result from one item to another. Use the vocabulary of the job '
+    + 'description only to rename what cv.md already states, never to add something it does not state.';
+  const NOT_LATEX = '--template is for LaTeX CVs: add --latex, or set cv.output_format to latex in config/profile.yml.';
+  const asPattern = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const DEFAULT_TEMPLATE = readFileSync(join(ROOT, 'lib', 'ollama-cv-latex-default.tex'), 'utf-8');
+  /** A template pack in a data root: data/templates/<name>/cv-latex.tex. */
+  const writePack = (root, name, text) => {
+    mkdirSync(join(root, 'data', 'templates', name), { recursive: true });
+    writeFileSync(join(root, 'data', 'templates', name, 'cv-latex.tex'), text);
+  };
+
+  test('a reply in a code fence is saved as the .json and the .tex, from a prompt that asks for the payload and holds no HTML template', async () => {
+    const { CV_PAYLOAD_SCHEMA } = await import('../lib/ollama-cv-latex.mjs');
+    const root = makeRoot();
+    const report = writeReport(root);
+    const { tex, json } = latexFiles(report);
+    const fenced = ['Here is the tailored CV as one JSON object:', '', '```json', PAYLOAD_REPLY, '```', '', 'The roles are in the order cv.md gives them.'].join('\n');
+    await withStub({ reply: () => fenced }, async (stub) => {
+      const run = await cli(['tailor', '001', '--latex', '--url', stub.url], { root });
+      assertExit(run, 0);
+      assert.deepEqual(stub.paths(), ['GET /api/tags', 'POST /api/show', 'POST /api/chat']);
+      const [system, user] = stub.requests[2].body.messages.map((message) => message.content);
+      // The schema of the payload, and nothing of the HTML request: two schemas
+      // that contradict each other, and a template the reply is not to fill.
+      assert.ok(system.includes(CV_PAYLOAD_SCHEMA), 'the system prompt lacks the schema of the payload');
+      for (const part of ['PDF TAILORING MODE (pdf.md)', '### JSON Input Schema', 'HTML TEMPLATE (cv-template.html)']) {
+        assert.ok(!system.includes(part), `the system prompt holds ${part}`);
+      }
+      for (const part of ['SYSTEM CONTEXT (_shared.md)', 'WRITING GUARDRAILS (_writing.md)', '[cv.md]\n# CV -- Alex Chen',
+        '[config/profile.yml]\n# Career-Ops Profile Configuration', 'at most 2 pages']) {
+        assert.ok(system.includes(part), `the system prompt lacks: ${part}`);
+      }
+      // The report without its archive, then the posting, and the two notes measured on the HTML request, last.
+      assert.ok(user.startsWith(`EVALUATION REPORT:\n\n${report.body}\n\nJOB DESCRIPTION:\n\n${JD.trim()}\n\n`), user.slice(0, 300));
+      assert.ok(user.endsWith(`\n\n${NO_TOOLS_NOTE}\n\n${GROUNDING}`), user.slice(-400));
+
+      // No HTML: the .json the checks read, and the .tex the template made of it.
+      assert.deepEqual(listing(join(root, 'output')), [json, tex]);
+      assert.deepEqual(JSON.parse(read(root, 'output', json)), { template: 'default', ...CV_PAYLOAD });
+      const saved = read(root, 'output', tex);
+      assert.ok(saved.startsWith('% career-ops-latex: template=default\n%!TEX TS-program = pdflatex\n'), saved.slice(0, 160));
+      // The header is the profile's, and the text is the payload's.
+      assert.ok(saved.includes('{\\LARGE\\bfseries Jane Smith}'), 'the name of the profile is not on the CV');
+      assert.ok(saved.includes('\\cvEntryHead{Senior ML Engineer / ML Platform Lead}{TechFin Corp}{Austin, TX}{2020-2024}\\cvStop{.}'));
+      assert.ok(run.stdout.includes(`✅  Tailored CV saved: output/${tex}`), run.stdout);
+      assert.match(run.stdout, /pdf payload:\s+\d+\.\dk prompt \/ \d+\.\dk completion/);
+      // The next step names the file: `pdf 001` would look for the report's HTML CV.
+      assert.match(run.stderr, new RegExp(`^ {4}Next, the PDF: node ollama-runner\\.mjs pdf output/${asPattern(tex)}$`, 'm'));
+      assert.doesNotMatch(run.stderr, /❌|⚠️/);
+    });
+  });
+
+  test('a reply that is not a payload is asked for once more, naming what is wrong, and a retry that is one is saved', async () => {
+    const root = makeRoot();
+    const report = writeReport(root);
+    const noRole = replyWith((payload) => { payload.experience[0].role = ''; });
+    const refused = await latexHere(root, { reply: noRole });
+    assert.deepEqual([refused.result.success, refused.result.code], [false, 'EMPTY']);
+    assert.equal(refused.client.requests.length, 2, 'exactly one retry');
+    assert.ok(refused.err.includes('Attempt 1 was not usable (experience[0] (TechFin Corp) has no role). Asking again'), refused.err);
+    assert.ok(refused.err.includes('Reply rejected after 2 attempts: experience[0] (TechFin Corp) has no role.'), refused.err);
+    assert.match(refused.err, /Nothing was saved\./);
+    assert.deepEqual(listing(join(root, 'output')), []);
+
+    const retried = await latexHere(root, { reply: (n) => (n === 0 ? 'I will start with the summary, then the roles.' : PAYLOAD_REPLY) });
+    assert.equal(retried.result.success, true, retried.result.reason);
+    assert.equal(retried.client.requests.length, 2);
+    assert.ok(retried.err.includes('Attempt 1 was not usable (no JSON object was found)'), retried.err);
+    assert.deepEqual(listing(join(root, 'output')), [latexFiles(report).json, latexFiles(report).tex]);
+  });
+
+  test('the request asks for cv.md\'s own sentences, and a joined one is asked for again with a sentence about wording', async () => {
+    const root = makeRoot();
+    writeReport(root);
+    // The local model's habit, met on real runs: the two sentences of one cv.md
+    // bullet joined with a semicolon. The check anchors the joined clause to
+    // the sentence it shares most words with, and the other sentence's verb
+    // opens a clause that anchor does not use.
+    const twoSentences = 'Mentored 3 junior engineers. Established a weekly model review that cut failed releases by 30%';
+    const cv = read(root, 'cv.md');
+    const last = '- Established model monitoring: drift detection, performance dashboards (Grafana), automated retraining triggers';
+    assert.ok(cv.includes(last), 'the example CV no longer has the bullet this test adds a bullet after');
+    writeFileSync(join(root, 'cv.md'), cv.replace(last, `${last}\n- ${twoSentences}`));
+    const withBullet = (text) => replyWith((payload) => { payload.experience[0].blocks[0].bullets.push(text); });
+    const joined = withBullet(twoSentences.replace('. Established', '; established'));
+    const { result, client } = await latexHere(root, { reply: (n) => (n === 0 ? joined : withBullet(twoSentences)) });
+    assert.equal(result.success, true, result.reason);
+    assert.equal(client.requests.length, 2);
+    assert.ok(client.requests[0].system.includes('11. Sentences: copy each sentence of a cv.md bullet as cv.md writes it'),
+      'the rules do not ask for cv.md\'s own sentences');
+    const [first, second] = client.requests.map((request) => request.user);
+    const feedback = second.slice(first.length);
+    assert.match(feedback, /drift=/, feedback);
+    assert.ok(feedback.endsWith('Where a line above says a clause opens with a word its source bullet does not use, copy the '
+      + 'sentences of that cv.md bullet as cv.md writes them: one sentence each, each opening with its own verb, never two '
+      + 'joined with a semicolon or a comma.'), feedback.slice(-400));
+  });
+
+  test('roles that are not newest-first by start date block the CV, even in cv.md\'s own order, and the second request asks for that order', async () => {
+    const root = makeRoot();
+    writeReport(root);
+    const reordered = replyWith((payload) => { payload.experience.reverse(); });
+    const { result, client, err } = await latexHere(root, { reply: (n) => (n === 0 ? reordered : PAYLOAD_REPLY) });
+    assert.equal(result.success, true, result.reason);
+    assert.equal(client.requests.length, 2);
+    const [first, second] = client.requests.map((request) => request.user);
+    assert.ok(second.startsWith(first), 'the second request does not repeat the first');
+    // In words of its own: the order is no thing cv.md lacks, which is what the fact check's sentence would say of it.
+    assert.equal(second.slice(first.length), [
+      '',
+      '',
+      'An earlier draft of this CV was rejected because its jobs are not newest first by start date:',
+      '- CV work experience is not in reverse-chronological order: "2020-2024" appears after "2018-2020" but starts later.',
+      '',
+      'Write the CV again with the jobs in reverse-chronological order: the job that started last comes first.',
+    ].join('\n'));
+    assert.match(err, /The checks block this CV \(1 finding left after removing what could be removed\)\. Asking once more/);
+    // The CV kept is the second, newest first.
+    assert.deepEqual(result.payload.experience.map(({ company }) => company), ['TechFin Corp', 'DataStartup Inc']);
+
+    // The check reads the CV alone, never cv.md. A cv.md that lists the role
+    // that started later second gets a CV in its own order blocked all the
+    // same, and the run says what the check holds it to. With no second
+    // request the run fails, and does not say the CV states what cv.md lacks:
+    // adding evidence changes nothing.
+    const listedOtherwise = makeRoot();
+    writeReport(listedOtherwise);
+    const cv = read(listedOtherwise, 'cv.md');
+    const techFin = cv.slice(cv.indexOf('### TechFin Corp'), cv.indexOf('### DataStartup Inc'));
+    const dataStartup = cv.slice(cv.indexOf('### DataStartup Inc'), cv.indexOf('## Projects'));
+    writeFileSync(join(listedOtherwise, 'cv.md'), cv.replace(`${techFin}${dataStartup}`, `${dataStartup}${techFin}`));
+    assert.ok(read(listedOtherwise, 'cv.md').indexOf('### DataStartup Inc') < read(listedOtherwise, 'cv.md').indexOf('### TechFin Corp'),
+      'the example CV no longer has the two jobs this test swaps');
+    const once = await latexHere(listedOtherwise, { reply: reordered, cfg: { ...cfg, retries: 0 } });
+    assert.deepEqual([once.result.success, once.result.code], [false, 'FACT_CHECK']);
+    assert.match(once.err, /^❌ {2}The checks block this CV: its roles are not newest-first by start date \(1 finding\)\.$/m);
+    assert.doesNotMatch(once.err, /it states what cv\.md|order cv\.md gives/);
+  });
+
+  test('a CV the final text check blocks is kept as its .json alone, and a finding with a backslash says how to reword it', async () => {
+    // A line true to cv.md, a backslash in a list of tools after "using". The
+    // checks of the projection pass it; the final text check reads the .tex,
+    // where the backslash is written \textbackslash{}, and reads that as a tool.
+    const root = makeRoot();
+    const report = writeReport(root);
+    const { tex, json } = latexFiles(report);
+    const line = 'Set up experiment tracking using MLflow and C:\\models\\registry paths';
+    writeFileSync(join(root, 'cv.md'), read(root, 'cv.md').replace('- Set up experiment tracking with MLflow and model versioning', `- ${line}`));
+    assert.ok(read(root, 'cv.md').includes(line), 'the example CV no longer has the bullet this test rewrites');
+    const reply = replyWith((payload) => { payload.experience[1].blocks[0].bullets[2] = line; });
+    const { result, client, err } = await latexHere(root, { reply });
+    assert.deepEqual([result.success, result.code, result.saved], [false, 'FACT_CHECK', true]);
+    // Not a finding of the projection, so the model is not asked again.
+    assert.equal(client.requests.length, 1);
+    assert.equal(result.factCheck.verdict, 'block');
+    assert.match(result.factCheck.findings[0], /tool=c:\\textbackslash/);
+    assert.deepEqual(listing(join(root, 'output')), [json]);
+    assert.ok(!existsSync(join(root, 'output', tex)));
+    assert.match(err, /^❌ {2}The final text check blocks this CV: Fact check failed for /m);
+    assert.match(err, /^ {4}The check misread an escaped character: reword that line in the \.json\.$/m);
+    assert.ok(err.includes(`The CV is kept for you to work on: output/${json}. No .tex was written, and no PDF.`), err);
+  });
+
+  test('a CV with an employer cv.md does not have is kept as its .json alone, fails with FACT_CHECK, and leaves an earlier .tex as it was', async () => {
+    const root = makeRoot();
+    const report = writeReport(root);
+    const { tex, json } = latexFiles(report);
+    mkdirSync(join(root, 'output'), { recursive: true });
+    writeFileSync(join(root, 'output', tex), 'EARLIER_TEX_MARKER\n');
+    const invented = replyWith((payload) => { payload.experience[1].company = 'Lumenfield Analytics'; });
+    await withStub({ reply: () => invented }, async (stub) => {
+      const run = await cli(['tailor', '001', '--latex', '--json', '--url', stub.url], { root });
+      assertExit(run, 1);
+      assert.equal(stub.generations().length, 2, 'one request, and one more with the findings');
+      const receipt = JSON.parse(run.stdout);
+      assert.deepEqual(
+        [receipt.success, receipt.code, receipt.format, receipt.saved, receipt.payload, 'tex' in receipt, 'text' in receipt],
+        [false, 'FACT_CHECK', 'latex', true, `output/${json}`, false, false],
+      );
+      assert.equal(receipt.factCheck.verdict, 'block');
+      assert.ok(receipt.factCheck.findings.some((finding) => /employer=lumenfield analytics/i.test(finding)), JSON.stringify(receipt.factCheck));
+      // The .json is kept for the owner to work on. No .tex of this CV was
+      // written, and the one an earlier run left is as it was.
+      assert.deepEqual(listing(join(root, 'output')), [json, tex]);
+      assert.equal(read(root, 'output', tex), 'EARLIER_TEX_MARKER\n');
+      assert.equal(JSON.parse(read(root, 'output', json)).experience[1].company, 'Lumenfield Analytics');
+      assert.match(run.stderr, /❌ {2}The fact check blocks this CV: it states what cv\.md and article-digest\.md do not \(\d+ findings?\)\./);
+      assert.ok(run.stderr.includes(`The CV is kept for you to work on: output/${json}. No .tex was written, and no PDF.`), run.stderr);
+      // The ways on name a command that tailors this report in LaTeX again, and the .json.
+      assert.ok(run.stderr.includes('Run `node ollama-runner.mjs tailor 001 --latex` again: every run writes a different CV'), run.stderr);
+      assert.ok(run.stderr.includes(`Or edit output/${json} and run \`node ollama-runner.mjs pdf output/${json}\``), run.stderr);
+      assert.doesNotMatch(run.stdout + run.stderr, /Tailored CV saved/);
+    });
+  });
+
+  test('a finding in a sentence is asked for once more, with the finding, and the better CV is kept', async () => {
+    const root = makeRoot();
+    const report = writeReport(root);
+    const inflated = replyWith((payload) => { payload.summary[0] += ' Cut inference cost by 73%.'; });
+    const { result, client, err } = await latexHere(root, { reply: (n) => (n === 0 ? inflated : PAYLOAD_REPLY) });
+    assert.deepEqual([result.success, result.saved, result.attempts], [true, true, 2]);
+    const [first, second] = client.requests.map((request) => request.user);
+    assert.ok(second.startsWith(first), 'the second request does not repeat the first');
+    assert.ok(second.endsWith([
+      '',
+      '',
+      'An earlier draft of this CV was rejected by the fact check, because it named things that cv.md and article-digest.md do not contain:',
+      '- metric-like claim absent from sources: 73%',
+      '',
+      'Write the CV again without them. Do not name them anywhere, not in the skills, the summary or a bullet. '
+        + 'A keyword from the job description may only be used where the candidate\'s own files support it.',
+    ].join('\n')), second.slice(-600));
+    assert.deepEqual(JSON.parse(read(root, 'output', latexFiles(report).json)), { template: 'default', ...CV_PAYLOAD });
+    assert.doesNotMatch(err, /❌/);
+  });
+
+  test('a skill cv.md does not have is taken out of the .json and the .tex, and named', async () => {
+    const root = makeRoot();
+    const report = writeReport(root);
+    const { tex, json } = latexFiles(report);
+    const keyworded = replyWith((payload) => { payload.skills[2].items = 'Kubernetes, OpenTelemetry, Kafka, Redis, PostgreSQL, AWS'; });
+    const { result, client, err } = await latexHere(root, { reply: keyworded });
+    assert.equal(result.success, true, result.reason);
+    assert.equal(client.requests.length, 1, 'an entry the runner can remove is no reason to ask again');
+    assert.deepEqual(result.removed, [{ where: 'skills', text: 'OpenTelemetry' }]);
+    assert.deepEqual(result.payload, CV_PAYLOAD);
+    assert.deepEqual(JSON.parse(read(root, 'output', json)), { template: 'default', ...CV_PAYLOAD });
+    const saved = read(root, 'output', tex);
+    assert.ok(!saved.includes('OpenTelemetry'), 'the .tex still names the skill');
+    assert.ok(saved.includes('\\cvSkill{Infra}{Kubernetes, Kafka, Redis, PostgreSQL, AWS}\\cvStop{.}'), saved);
+    assert.match(err, /Removed from the CV, because the fact check found it in neither cv\.md nor article-digest\.md: OpenTelemetry \(skills\)\./);
+  });
+
+  test('a project link whose address none of the candidate\'s files holds is taken off; one they hold stays', async () => {
+    const root = makeRoot();
+    const report = writeReport(root);
+    const { tex, json } = latexFiles(report);
+    // An address with "&" in it: the HTML the link rule reads spells it "&amp;".
+    const invented = 'https://github.com/alexchen/llm-eval-toolkit?tab=readme&x=1';
+    const linked = replyWith((payload) => {
+      payload.projects.items[0].url = 'https://github.com/alexchen';
+      payload.projects.items[1].url = invented;
+    });
+    const { result, client, err } = await latexHere(root, { reply: linked });
+    assert.equal(result.success, true, result.reason);
+    assert.equal(client.requests.length, 1, 'a link the runner can take off is no reason to ask again');
+    assert.deepEqual(result.unlinked, [invented]);
+    assert.deepEqual(result.payload.projects.items.map(({ url }) => url), ['https://github.com/alexchen', '']);
+    assert.deepEqual(JSON.parse(read(root, 'output', json)).projects.items.map(({ url }) => url), ['https://github.com/alexchen', '']);
+    const saved = read(root, 'output', tex);
+    assert.ok(saved.includes('\\cvProject{FraudShield}{https://github.com/alexchen}{'), saved);
+    assert.ok(saved.includes('\\cvProject{LLM Eval Toolkit}{}{'), saved);
+    assert.ok(!saved.includes('llm-eval-toolkit'), 'the address taken off is still in the .tex');
+    assert.ok(err.includes('1 link taken off the CV, because its address is in none of your files (cv.md, config/profile.yml, '
+      + `article-digest.md): ${invented}.`), err);
+  });
+
+  test('a CV the check passes with a warning lists the warning itself, and does not send the owner to generate-pdf.mjs', async () => {
+    const root = makeRoot();
+    writeReport(root);
+    // A phrase the owner asks to be warned about, which the persona's summary holds.
+    writeFileSync(join(root, 'config', 'cv-facts.json'), JSON.stringify({ warn_phrases: ['Series B'] }));
+    const { result, err } = await latexHere(root);
+    assert.equal(result.success, true, result.reason);
+    assert.deepEqual(result.factCheck, { verdict: 'warn', findings: [], warnings: 1 });
+    assert.match(err, /^⚠️ {3}The fact check passes this CV with 1 warning:$/m);
+    assert.match(err, /^ {4}- advisory phrase: series b$/im);
+    // No PDF of this CV goes through generate-pdf.mjs, which is where the HTML path sends the owner.
+    assert.doesNotMatch(err, /generate-pdf\.mjs/);
+  });
+
+  test('a warning of the final text check alone makes it a CV that passes with warnings, and a warning both checks give counts once', async () => {
+    const root = makeRoot();
+    writeReport(root);
+    // A long dash in the prose: the final text check reads the .tex and warns
+    // about it, and no check of the projection reads dashes.
+    const dashed = replyWith((payload) => {
+      payload.summary[0] = payload.summary[0].replace('production ML systems.', 'production ML systems — end to end.');
+    });
+    const alone = await latexHere(root, { reply: dashed });
+    assert.equal(alone.result.success, true, alone.result.reason);
+    assert.deepEqual(alone.result.factCheck, { verdict: 'warn', findings: [], warnings: 1 });
+    assert.match(alone.err, /^⚠️ {3}Voice check warning for cv-jane-smith-\S+\.tex: an em dash\./m);
+
+    // The warn phrase is in the text both checks read: listed once, counted once, and the dash on top of it.
+    writeFileSync(join(root, 'config', 'cv-facts.json'), JSON.stringify({ warn_phrases: ['Series B'] }));
+    const both = await latexHere(root, { reply: dashed });
+    assert.equal(both.result.success, true, both.result.reason);
+    assert.deepEqual(both.result.factCheck, { verdict: 'warn', findings: [], warnings: 2 });
+    assert.equal(both.err.split(/advisory phrase: series b/i).length - 1, 1, both.err);
+  });
+
+  test('cv.output_format: latex in the profile makes the CV in LaTeX, and --html makes it in HTML all the same', async () => {
+    const root = makeRoot({ profile: 'candidate:\n  full_name: "Alex Chen"\ncv:\n  output_format: latex\n' });
+    const report = writeReport(root);
+    const { tex, json } = latexFiles(report, 'alex-chen');
+    const { ui } = quietUi();
+    const result = await tailorCv('001', { cfg, client: fakeClient({ reply: PAYLOAD_REPLY }), ui, dataRoot: root });
+    assert.deepEqual([result.success, result.format, result.relPath], [true, 'latex', `output/${tex}`], result.reason);
+    await withStub({}, async (stub) => {
+      const run = await cli(['tailor', '001', '--html', '--url', stub.url], { root });
+      assertExit(run, 0);
+      assert.ok(stub.generations()[0].body.messages[0].content.includes('HTML TEMPLATE (cv-template.html)'), 'an HTML CV was not asked for');
+      const html = `cv-alex-chen-${report.stem}.html`;
+      assert.deepEqual(listing(join(root, 'output')), [html, json, tex]);
+      assert.equal(read(root, 'output', html), SAVED_CV);
+      // The next step names the HTML file: under this profile `pdf 001` takes the report's LaTeX CV.
+      assert.match(run.stderr, new RegExp(`^ {4}Next, the PDF: node ollama-runner\\.mjs pdf output/${asPattern(html)}$`, 'm'));
+    });
+  });
+
+  test('under cv.output_format: latex, each command a CV made in HTML names to run next makes HTML again', async () => {
+    const root = makeRoot({ profile: 'candidate:\n  full_name: "Alex Chen"\ncv:\n  output_format: latex\n' });
+    writeReport(root);
+    // A CV the fact check blocks: tailoring the report again is the first way on, and it has to ask for HTML.
+    const { ui, written } = quietUi();
+    const blocked = await tailorCv('001', { cfg: { ...cfg, retries: 0 }, client: fakeClient({ reply: INFLATED_CV }), ui, dataRoot: root, format: 'html' });
+    assert.deepEqual([blocked.success, blocked.code], [false, 'FACT_CHECK'], blocked.reason);
+    assert.ok(written.err.includes('Four ways on. Run `node ollama-runner.mjs tailor 001 --html` again: every run writes a different CV'),
+      written.err);
+    // No HTML CV for the report yet: the command that makes one asks for HTML.
+    const bare = makeRoot({ profile: 'candidate:\n  full_name: "Alex Chen"\ncv:\n  output_format: latex\n' });
+    writeReport(bare);
+    const run = await cli(['pdf', '001', '--html'], { root: bare });
+    assertExit(run, 1);
+    assert.match(run.stderr, /❌ {2}No tailored CV for reports\/001-northwind-robotics-\S+\.md in .+output\. Run first: node ollama-runner\.mjs tailor 001 --html\n/);
+  });
+
+  test('a pack the profile names is the template, --template default overrides it, and line 1 of the .tex names the one used', async () => {
+    const root = makeRoot({ profile: 'candidate:\n  full_name: "Alex Chen"\ncv:\n  output_format: latex\n  latex_template: plain\n' });
+    const report = writeReport(root);
+    const { tex } = latexFiles(report, 'alex-chen');
+    // The default template with a line of its own, so the .tex shows which template wrote it.
+    writePack(root, 'plain', DEFAULT_TEMPLATE.replace('\\begin{document}', '% PLAIN_PACK_MARKER\n\\begin{document}'));
+    const { ui } = quietUi();
+    const chosen = await tailorCv('001', { cfg, client: fakeClient({ reply: PAYLOAD_REPLY }), ui, dataRoot: root });
+    assert.deepEqual([chosen.success, chosen.template], [true, 'plain'], chosen.reason);
+    const fromPack = read(root, 'output', tex);
+    assert.ok(fromPack.startsWith('% career-ops-latex: template=plain\n'), fromPack.slice(0, 80));
+    assert.ok(fromPack.includes('PLAIN_PACK_MARKER'));
+
+    await withStub({ reply: () => PAYLOAD_REPLY }, async (stub) => {
+      const run = await cli(['tailor', '001', '--template', 'default', '--url', stub.url], { root });
+      assertExit(run, 0);
+      const fromDefault = read(root, 'output', tex);
+      assert.ok(fromDefault.startsWith('% career-ops-latex: template=default\n'), fromDefault.slice(0, 80));
+      assert.ok(!fromDefault.includes('PLAIN_PACK_MARKER'));
+    });
+  });
+
+  test('--latex with --html, --template without LaTeX, and --pdf with --no-save are refused before anything is sent', async () => {
+    const root = makeRoot();
+    writeReport(root);
+    await withStub({}, async (stub) => {
+      for (const [args, reason] of [
+        [['--latex', '--html'], '--latex cannot be used with --html: a CV is made in one format.'],
+        [['--template', 'plain'], NOT_LATEX],
+        [['--html', '--template', 'default'], NOT_LATEX],
+        [['--latex', '--pdf', '--no-save'], '--pdf cannot be used with --no-save: the PDF is compiled from the saved .tex.'],
+      ]) {
+        const run = await cli(['tailor', '001', ...args, '--json', '--url', stub.url], { root });
+        assertExit(run, 1, args.join(' '));
+        assert.deepEqual(JSON.parse(run.stdout), { command: 'tailor', success: false, reason, code: 'USAGE' }, args.join(' '));
+        assert.ok(run.stderr.includes(`❌  ${reason}`), run.stderr);
+      }
+      assert.deepEqual(stub.requests, []);
+    });
+    assert.deepEqual(listing(join(root, 'output')), []);
+  });
+
+  test('the format and the template are the flags\', else the profile\'s, and a profile that cannot be read chooses HTML', () => {
+    const latexProfile = 'cv:\n  output_format: latex\n  latex_template: plain\n';
+    const html = { format: 'html', template: 'default' };
+    for (const [flags, profile, expected] of [
+      [{}, '', html],
+      // Missing, unreadable or of another shape: HTML, and no error. loadCandidate() reports a missing profile.
+      [{}, 'cv: [never closed', html],
+      [{}, 'cv: 5\n', html],
+      [{}, '- a list, not a mapping\n', html],
+      // Exactly latex: validate-profile.mjs takes no other spelling of it, and text is not LaTeX.
+      [{}, 'cv:\n  output_format: LaTeX\n', html],
+      [{}, 'cv:\n  output_format: text\n', html],
+      [{}, latexProfile, { format: 'latex', template: 'plain' }],
+      [{ html: true }, latexProfile, { format: 'html', template: 'plain' }],
+      [{ template: 'default' }, latexProfile, { format: 'latex', template: 'default' }],
+      [{ latex: true }, '', { format: 'latex', template: 'default' }],
+      [{ latex: true, template: 'plain' }, '', { format: 'latex', template: 'plain' }],
+      [{ latex: true }, 'cv:\n  latex_template: ""\n', { format: 'latex', template: 'default' }],
+      // A value that is not text goes on as its JSON, for resolveLatexTemplate() to judge: a number can name a pack,
+      // a list is no name (String() made [plain] the pack plain), and one that holds itself stops nothing here.
+      [{ latex: true }, 'cv:\n  latex_template: 2024\n', { format: 'latex', template: '2024' }],
+      [{ latex: true }, 'cv:\n  latex_template: [plain]\n', { format: 'latex', template: '["plain"]' }],
+      [{ latex: true }, 'cv:\n  latex_template: &self [*self]\n', { format: 'latex', template: '[object]' }],
+    ]) {
+      assert.deepEqual(readCvFormat(flags, profile), expected, `${JSON.stringify(flags)} ${JSON.stringify(profile)}`);
+    }
+    assert.throws(() => readCvFormat({ latex: true, html: true }, latexProfile),
+      { name: 'CommandLineError', message: '--latex cannot be used with --html: a CV is made in one format.' });
+    assert.throws(() => readCvFormat({ template: 'plain' }, ''), { name: 'CommandLineError', message: NOT_LATEX });
+    assert.throws(() => readCvFormat({ html: true, template: 'plain' }, latexProfile), { name: 'CommandLineError', message: NOT_LATEX });
+  });
+
+  test('a template, a profile or a locked section a LaTeX CV cannot be made with is refused before anything is sent', async () => {
+    const withName = 'candidate:\n  full_name: "Alex Chen"\n';
+    for (const [label, profile, prepare, pattern] of [
+      ['a template that is not there', withName, () => ({ template: 'missing' }),
+        /❌ {2}No template "missing": data\/templates\/missing\/cv-latex\.tex was not found\. Templates here: default\.\n/],
+      ['a placeholder the renderer does not fill', withName, (root) => {
+        writePack(root, 'awards', DEFAULT_TEMPLATE.replace('{{SKILLS}}', '{{SKILLS}}\n{{AWARDS}}'));
+        return { template: 'awards' };
+      }, /❌ {2}data\/templates\/awards\/cv-latex\.tex, line \d+: \{\{AWARDS\}\} is not a placeholder of a LaTeX CV\. Templates here: default, awards\.\n/],
+      ['a locked section a LaTeX CV has no section for', `${withName}cv:\n  locked_sections:\n    - "Core Competencies"\n`, (root) => {
+        writeFileSync(join(root, 'cv.md'), `${read(root, 'cv.md')}\n## Core Competencies\n\n- MLOps, Kafka\n`);
+        return {};
+      }, /❌ {2}cv\.locked_sections names 'competencies', which a LaTeX CV has no section for\. Remove it from the list, or tailor with --html\.\n/],
+      ['a profile with no candidate block', 'cv:\n  output_format: latex\n', () => ({}),
+        /❌ {2}config\/profile\.yml has no candidate\.full_name: the CV header needs it\.\n/],
+      ['a page budget that is not one', `${withName}cv:\n  max_pages: 0\n`, () => ({}),
+        /❌ {2}Invalid page budget in config\/profile\.yml: cv\.max_pages "0" is not a positive integer\. Fix cv\.max_pages or cv\.strict_pages in config\/profile\.yml\. Nothing was sent\.\n/],
+      // Not the pack named in it: a list is not a name.
+      ['a list where the profile names a template', `${withName}cv:\n  latex_template: [plain]\n`, (root) => {
+        writePack(root, 'plain', DEFAULT_TEMPLATE);
+        return {};
+      }, /❌ {2}"\[\\"plain\\"\]" is not a template name: a name is lower-case letters, digits and hyphens, and begins with a letter or a digit\. Templates here: default, plain\.\n/],
+    ]) {
+      const root = makeRoot({ profile });
+      writeReport(root);
+      const deps = prepare(root);
+      const { result, client, err } = await latexHere(root, deps);
+      assert.deepEqual([result.success, result.code], [false, 'SETUP'], `${label}: ${result.reason}`);
+      assert.match(err, pattern, label);
+      // Not even the model list.
+      assert.deepEqual(client.calls, [], label);
+      assert.deepEqual(listing(join(root, 'output')), [], label);
+      assert.doesNotMatch(err, /--max-pages/, label);
+    }
+  });
+
+  test('with an engine check asked for, an engine that is not there stops the run before anything is sent', async () => {
+    const root = makeRoot();
+    writeReport(root);
+    const asked = [];
+    const missing = async (engine) => {
+      asked.push(engine);
+      return { ok: false, code: 'NO_ENGINE', reason: `The template's engine, ${engine}, is not installed: ${engine} --version did not run.` };
+    };
+    const { result, client, err } = await latexHere(root, { compileCheck: missing });
+    assert.deepEqual([result.success, result.code], [false, 'NO_ENGINE'], result.reason);
+    // The engine the template names: the default template runs on pdflatex.
+    assert.deepEqual(asked, ['pdflatex']);
+    assert.match(err, /❌ {2}The template's engine, pdflatex, is not installed/);
+    assert.match(err, /Nothing was sent\./);
+    assert.deepEqual(client.calls, []);
+    assert.deepEqual(listing(join(root, 'output')), []);
+    // An engine that answers is no reason to stop.
+    const present = await latexHere(root, { compileCheck: async () => null });
+    assert.equal(present.result.success, true, present.result.reason);
+  });
+
+  test('only an engine that did not answer at all is one to install: one out of time, or one the check could not start, is not', async () => {
+    const root = makeRoot();
+    writeReport(root);
+    for (const [problem, code, remedy] of [
+      [{ code: 'NO_ENGINE', reason: 'The template\'s engine, pdflatex, is not installed: pdflatex --version did not run.' }, 'NO_ENGINE',
+        'Install pdflatex'],
+      [{ code: 'TIMEOUT', reason: 'pdflatex --version did not answer within 2 minutes.' }, 'LATEX',
+        'Run `pdflatex --version` in a terminal to see what keeps it from answering'],
+      [{ code: 'COMPILE', reason: 'The engine check stopped (EACCES).' }, 'LATEX',
+        'Run `pdflatex --version` in a terminal to see why it does not start'],
+    ]) {
+      const { result, client, err } = await latexHere(root, { compileCheck: async () => ({ ok: false, ...problem }) });
+      assert.deepEqual([result.success, result.code], [false, code], problem.code);
+      assert.ok(err.includes(`❌  ${problem.reason}\n    ${remedy}, or tailor without --pdf and compile the CV later. Nothing was sent.\n`), err);
+      assert.equal(/Install/.test(err), problem.code === 'NO_ENGINE', err);
+      assert.deepEqual(client.calls, [], problem.code);
+    }
+    assert.deepEqual(listing(join(root, 'output')), []);
+  });
+
+  test('--no-save prints the .tex and writes nothing', async () => {
+    const root = makeRoot();
+    writeReport(root);
+    await withStub({ reply: () => PAYLOAD_REPLY }, async (stub) => {
+      const run = await cli(['tailor', '001', '--latex', '--no-save', '--url', stub.url], { root });
+      assertExit(run, 0);
+      assert.deepEqual(listing(join(root, 'output')), []);
+      // Once, as the file itself: redirected, stdout is the .tex.
+      assert.ok(run.stdout.startsWith('% career-ops-latex: template=default\n'), run.stdout.slice(0, 200));
+      assert.equal(run.stdout.split('\\end{document}').length - 1, 1);
+      assert.doesNotMatch(run.stdout + run.stderr, /Tailored CV saved|Next, the PDF/);
+    });
+  });
+
+  test('with redact_contact_info the model sees placeholders, and the header of the .tex carries the real details', async () => {
+    const profile = [
+      'candidate:', '  full_name: "Alex Chen"', '  email: "alex@example.com"', '  linkedin: "linkedin.com/in/alexchen"',
+      'privacy:', '  redact_contact_info: true', '',
+    ].join('\n');
+    const root = makeRoot({ profile });
+    // The report was written by an evaluation that saw the CV as it is, and names the candidate.
+    const report = writeReport(root, { blocks: '## Verdict\n\nAlex Chen (alex@example.com) is a strong match for this role.' });
+    const { result, client } = await latexHere(root);
+    assert.equal(result.success, true, result.reason);
+    // The whole request as the client is handed it, both messages and every setting.
+    const sent = JSON.stringify(client.requests[0]);
+    for (const detail of ['Alex Chen', 'alex@example.com', 'linkedin.com/in/alexchen']) {
+      assert.ok(!sent.includes(detail), `${detail} was sent to the model`);
+    }
+    assert.ok(sent.includes('# CV -- Candidate Name') && sent.includes('candidate@example.com'), 'the request holds no placeholder');
+    const saved = read(root, 'output', latexFiles(report, 'alex-chen').tex);
+    assert.ok(saved.includes('{\\LARGE\\bfseries Alex Chen}'), 'the real name is not on the CV');
+    assert.ok(saved.includes('alex@example.com') && !saved.includes('Candidate Name'), 'the contact line is not the real one');
+  });
+
+  test('with redact_contact_info the placeholders in the payload come back as the real details, and the link rule judges the real address', async () => {
+    // The GitHub address without its scheme, as profiles write it. The
+    // placeholder a model writes with one, https://github.com/candidate, comes
+    // back as the profile has it, schemeless, and the link rule judges only an
+    // address with a scheme: without the scheme put back, a project address
+    // made up under the placeholder went into the .tex unjudged.
+    const profile = [
+      'candidate:', '  full_name: "Alex Chen"', '  email: "alex@example.com"', '  github: "github.com/alexchen"',
+      'privacy:', '  redact_contact_info: true', '',
+    ].join('\n');
+    const root = makeRoot({ profile });
+    const report = writeReport(root);
+    const { tex, json } = latexFiles(report, 'alex-chen');
+    const reply = replyWith((payload) => {
+      payload.projects.items[0].url = 'https://github.com/candidate';
+      payload.projects.items[0].text += '. Maintained by Candidate Name';
+      payload.projects.items[1].url = 'https://github.com/candidate/llm-eval-toolkit';
+    });
+    const { result, client, err } = await latexHere(root, { reply });
+    assert.equal(result.success, true, result.reason);
+    const sent = JSON.stringify(client.requests[0]);
+    assert.ok(sent.includes('github.com/candidate') && !sent.includes('github.com/alexchen'), 'the request did not hold the placeholder address');
+    // The address made up under the placeholder is taken off, and named as the owner knows it; the profile's own stays.
+    assert.deepEqual(result.unlinked, ['https://github.com/alexchen/llm-eval-toolkit']);
+    assert.ok(err.includes('1 link taken off the CV, because its address is in none of your files (cv.md, config/profile.yml, '
+      + 'article-digest.md): https://github.com/alexchen/llm-eval-toolkit.'), err);
+    const items = JSON.parse(read(root, 'output', json)).projects.items;
+    assert.deepEqual(items.map(({ url }) => url), ['https://github.com/alexchen', '']);
+    assert.ok(items[0].text.endsWith('500+ GitHub stars. Maintained by Alex Chen'), items[0].text);
+    const written = read(root, 'output', tex);
+    assert.ok(written.includes('\\cvProject{FraudShield}{https://github.com/alexchen}{(Open Source) Real-time fraud detection framework. '
+      + 'Kafka Streams + feature store + model serving. 500+ GitHub stars. Maintained by Alex Chen}\\cvStop{.}'), written);
+    assert.ok(written.includes('\\cvProject{LLM Eval Toolkit}{}{'), written);
+    for (const placeholder of ['Candidate Name', 'github.com/candidate', 'llm-eval-toolkit']) {
+      assert.ok(!written.includes(placeholder) && !read(root, 'output', json).includes(placeholder), `${placeholder} was saved`);
+    }
+  });
+
+  test('tailoring a report again keeps the .tex and the .json it replaces as .bak, and says so', async () => {
+    const root = makeRoot();
+    const report = writeReport(root);
+    const { tex, json } = latexFiles(report);
+    const first = await latexHere(root);
+    assert.equal(first.result.success, true, first.result.reason);
+    assert.deepEqual(['backup' in first.result, 'payloadBackup' in first.result], [false, false]);
+    // The same CV again replaces nothing.
+    const same = await latexHere(root);
+    assert.deepEqual(['backup' in same.result, 'payloadBackup' in same.result], [false, false]);
+
+    // The owner changes both by hand, then tailors again where `pdf` was meant.
+    writeFileSync(join(root, 'output', tex), read(root, 'output', tex).replace('\\begin{document}', '% MY_HAND_EDIT\n\\begin{document}'));
+    writeFileSync(join(root, 'output', json), read(root, 'output', json).replace('UT Austin', 'UT Austin MY_HAND_EDIT'));
+    const again = await latexHere(root);
+    assert.deepEqual([again.result.backup, again.result.payloadBackup], [`output/${tex}.bak`, `output/${json}.bak`]);
+    assert.ok(read(root, 'output', `${tex}.bak`).includes('MY_HAND_EDIT') && read(root, 'output', `${json}.bak`).includes('MY_HAND_EDIT'));
+    assert.ok(!read(root, 'output', tex).includes('MY_HAND_EDIT') && !read(root, 'output', json).includes('MY_HAND_EDIT'));
+    assert.ok(again.err.includes(`An earlier CV for this report was replaced. It is kept as output/${tex}.bak and output/${json}.bak.`), again.err);
+    assert.deepEqual(listing(join(root, 'output')), [json, `${json}.bak`, tex, `${tex}.bak`]);
+  });
+
+  test('--json prints one object that names the .tex and the .json, and holds no path outside the data root', async () => {
+    const root = makeRoot();
+    const report = writeReport(root);
+    const { tex, json } = latexFiles(report);
+    await withStub({ reply: () => PAYLOAD_REPLY }, async (stub) => {
+      const run = await cli(['tailor', '001', '--latex', '--json', '--url', stub.url], { root });
+      assertExit(run, 0);
+      assert.equal(run.stdout.trim().split('\n').length, 1, run.stdout);
+      const receipt = JSON.parse(run.stdout);
+      assert.deepEqual(
+        [receipt.command, receipt.success, receipt.saved, receipt.format, receipt.tex, receipt.payload, receipt.template, receipt.report,
+          receipt.reportNum, receipt.model, receipt.attempts],
+        ['tailor', true, true, 'latex', `output/${tex}`, `output/${json}`, 'default', report.rel, '001', 'qwen3.8:27b', 1],
+      );
+      assert.deepEqual(receipt.factCheck, { verdict: 'pass', findings: [], warnings: 0 });
+      // The files are named, not copied into the receipt; the session and the absolute paths stay out of it.
+      for (const key of ['text', 'html', 'session', 'texPath', 'payloadPath', 'relPath', 'payloadRel']) {
+        assert.equal(key in receipt, false, `the receipt holds ${key}`);
+      }
+      assert.ok(!run.stdout.includes(JSON.stringify(root).slice(1, -1)) && !run.stdout.includes(root.replace(/\\/g, '/')),
+        'the receipt holds the path of the data root');
+      assert.ok(existsSync(join(root, receipt.tex)) && existsSync(join(root, receipt.payload)));
+    });
+  });
+
+  test('a title, a project name and a skills category copied from cv.md in bold are saved and printed without the asterisks', async () => {
+    const root = makeRoot();
+    const report = writeReport(root);
+    const { tex, json } = latexFiles(report);
+    const copied = replyWith((payload) => {
+      payload.experience[0].role = '**Senior ML Engineer / ML Platform Lead**';
+      payload.projects.items[0].name = '**FraudShield**';
+      payload.skills[0].category = '**ML/AI:**';
+    });
+    const { result } = await latexHere(root, { reply: copied });
+    assert.equal(result.success, true, result.reason);
+    assert.deepEqual(JSON.parse(read(root, 'output', json)), { template: 'default', ...CV_PAYLOAD });
+    const saved = read(root, 'output', tex);
+    assert.ok(!saved.includes('**'), 'the .tex prints asterisks');
+    for (const call of ['\\cvEntryHead{Senior ML Engineer / ML Platform Lead}{TechFin Corp}', '\\cvProject{FraudShield}{}', '\\cvSkill{ML/AI}{PyTorch,']) {
+      assert.ok(saved.includes(call), call);
+    }
+  });
+
+  test('a title and a project copied from cv.md in italics, _..._, are saved and printed without the underscores', async () => {
+    // The checks read `_FraudShield_` as italics, the words alone, and the PDF
+    // printed the underscores: no field of the .tex prints italics.
+    const root = makeRoot();
+    const report = writeReport(root);
+    const { tex, json } = latexFiles(report);
+    const copied = replyWith((payload) => {
+      payload.experience[0].role = '_Senior ML Engineer / ML Platform Lead_';
+      payload.projects.items[0].name = '_FraudShield_';
+      payload.projects.items[0].text = `_${payload.projects.items[0].text}_`;
+    });
+    const { result } = await latexHere(root, { reply: copied });
+    assert.equal(result.success, true, result.reason);
+    assert.deepEqual(JSON.parse(read(root, 'output', json)), { template: 'default', ...CV_PAYLOAD });
+    const saved = read(root, 'output', tex);
+    assert.ok(!saved.includes('\\_'), 'the .tex prints underscores');
+    for (const call of ['\\cvEntryHead{Senior ML Engineer / ML Platform Lead}{TechFin Corp}', '\\cvProject{FraudShield}{}{(Open Source)']) {
+      assert.ok(saved.includes(call), call);
+    }
+  });
+
+  test('a changed locked section saves nothing and asks no second time: the code is LOCKED_SECTIONS, as for an HTML CV', async () => {
+    const root = makeRoot({ profile: 'candidate:\n  full_name: "Jane Smith"\ncv:\n  locked_sections:\n    - "Work Experience"\n' });
+    writeReport(root);
+    const reworded = replyWith((payload) => {
+      payload.experience[1].blocks[0].bullets[1] = 'Implemented search ranking with learning-to-rank models at scale';
+    });
+    const { result, client, err } = await latexHere(root, { reply: reworded });
+    assert.deepEqual([result.success, result.code, result.format], [false, 'LOCKED_SECTIONS', 'latex'], result.reason);
+    assert.equal(client.requests.length, 1);
+    assert.match(err, /^ {4}Nothing was saved\. The section is locked under cv\.locked_sections in config\/profile\.yml\.$/m);
+    assert.deepEqual(listing(join(root, 'output')), []);
+  });
+
+  test('a CV the checks block under --no-save leaves out the way that edits its .json: none was written', async () => {
+    const root = makeRoot();
+    writeReport(root);
+    const invented = replyWith((payload) => { payload.experience[1].company = 'Lumenfield Analytics'; });
+    const { result, err } = await latexHere(root, { reply: invented, save: false, cfg: { ...cfg, retries: 0 } });
+    assert.deepEqual([result.success, result.code, result.saved], [false, 'FACT_CHECK', false]);
+    assert.match(err, /^ {4}Nothing was saved \(--no-save\)\.$/m);
+    assert.ok(err.includes('Three ways on. Run `node ollama-runner.mjs tailor 001 --latex` again: every run writes a different CV, and most '
+      + 'pass. Or add the evidence to cv.md or article-digest.md and tailor again; or, for a claim you have verified, add an exception to '
+      + 'config/cv-facts.json. Run without --no-save to keep a blocked CV as its .json, for you to edit.'), err);
+    assert.doesNotMatch(err, /Four ways on|edit the \.json|<file\.json>/);
+    assert.deepEqual(listing(join(root, 'output')), []);
+  });
+
+  test('under --no-save, the hint for a finding with a backslash names no .json: none was written', async () => {
+    const root = makeRoot();
+    writeReport(root);
+    const line = 'Set up experiment tracking using MLflow and C:\\models\\registry paths';
+    writeFileSync(join(root, 'cv.md'), read(root, 'cv.md').replace('- Set up experiment tracking with MLflow and model versioning', `- ${line}`));
+    assert.ok(read(root, 'cv.md').includes(line), 'the example CV no longer has the bullet this test rewrites');
+    const reply = replyWith((payload) => { payload.experience[1].blocks[0].bullets[2] = line; });
+    const { result, err } = await latexHere(root, { reply, save: false });
+    assert.deepEqual([result.success, result.code, result.saved], [false, 'FACT_CHECK', false]);
+    assert.match(err, /^ {4}The check misread an escaped character: reword that line\.$/m);
+    assert.doesNotMatch(err, /reword that line in the \.json/);
+    assert.match(err, /Run without --no-save to keep a blocked CV as its \.json, for you to edit\./);
+    assert.deepEqual(listing(join(root, 'output')), []);
+  });
+
+  test('with a template that shows years, the checks read the dates as they print: an end year cv.md does not have blocks the CV', async () => {
+    const yearsPack = DEFAULT_TEMPLATE.replace('% career-ops-latex: dates=full', '% career-ops-latex: dates=year');
+    assert.notEqual(yearsPack, DEFAULT_TEMPLATE, 'the default template no longer sets dates=full');
+    // The check reads no date in "Dec 2021 (contract)" and passes it with a
+    // warning. In years it prints 2018-2021, which cv.md's 2018-2020 contradicts.
+    const reply = replyWith((payload) => { payload.experience[1].dates = 'Jan 2018 \u2013 Dec 2021 (contract)'; });
+    const full = makeRoot();
+    writeReport(full);
+    const asWritten = await latexHere(full, { reply });
+    assert.equal(asWritten.result.success, true, asWritten.result.reason);
+    const root = makeRoot();
+    const report = writeReport(root);
+    writePack(root, 'years', yearsPack);
+    const { result, client } = await latexHere(root, { reply, template: 'years', cfg: { ...cfg, retries: 0 } });
+    assert.deepEqual([result.success, result.code], [false, 'FACT_CHECK'], result.reason);
+    assert.equal(client.requests.length, 1);
+    assert.ok(result.factCheck.findings.some((finding) => /employment-dates=datastartup inc: 2018.2021/.test(finding)), JSON.stringify(result.factCheck));
+    // No .tex prints the year the check blocks; the .json keeps the dates as they were written.
+    assert.deepEqual(listing(join(root, 'output')), [latexFiles(report).json]);
+    assert.equal(JSON.parse(read(root, 'output', latexFiles(report).json)).experience[1].dates, 'Jan 2018 \u2013 Dec 2021 (contract)');
+  });
+
+  test('with a template that shows years, a locked experience section whose dates in cv.md carry months stops the run with LOCKED_SECTIONS', async () => {
+    const yearsPack = DEFAULT_TEMPLATE.replace('% career-ops-latex: dates=full', '% career-ops-latex: dates=year');
+    const lockedRoot = () => {
+      const root = makeRoot({ profile: 'candidate:\n  full_name: "Jane Smith"\ncv:\n  locked_sections:\n    - "Work Experience"\n' });
+      writeReport(root);
+      const cv = read(root, 'cv.md');
+      assert.equal(cv.split('\n2018-2020').length - 1, 1, 'the example CV no longer dates its second job 2018-2020');
+      writeFileSync(join(root, 'cv.md'), cv.replace('\n2018-2020', '\nJan 2018 - Dec 2020'));
+      writePack(root, 'years', yearsPack);
+      return root;
+    };
+    // The section word for word, as cv.md has it: in full it passes.
+    const reply = replyWith((payload) => { payload.experience[1].dates = 'Jan 2018 - Dec 2020'; });
+    const full = await latexHere(lockedRoot(), { reply });
+    assert.equal(full.result.success, true, full.result.reason);
+    // In years it prints 2018-2020, which is not the section cv.md has.
+    const root = lockedRoot();
+    const { result, client } = await latexHere(root, { reply, template: 'years' });
+    assert.deepEqual([result.success, result.code], [false, 'LOCKED_SECTIONS'], result.reason);
+    assert.match(result.reason, /Locked section 'experience' was modified during tailoring/);
+    assert.equal(client.requests.length, 1);
+    assert.deepEqual(listing(join(root, 'output')), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The PDF of a LaTeX CV
+// ---------------------------------------------------------------------------
+//
+// `tailor --latex --pdf`, and `pdf` on a report's LaTeX CV, on its .json or on
+// its .tex. No TeX engine runs here: the runner is started with a stand-in for
+// the compile (the `compile` option of cli()), which records what it was
+// handed and returns a PDF of the pages a test asks for, or the failure it
+// names. What is held here is what the runner does around a compile: the
+// checks a payload goes through again before anything is compiled, so that no
+// route compiles a CV the checks block; the files it writes and the ones it
+// must leave as they are; the page limit; and the row of data/pdf-index.tsv,
+// which is what ticks the PDF column of the tracker.
+
+describe('the PDF of a LaTeX CV', { concurrency: 6 }, () => {
+  const cfg = readOllamaConfig({});
+  const PAYLOAD_REPLY = JSON.stringify(CV_PAYLOAD, null, 2);
+  /** The persona's payload with `change` made to a copy of it, as a model sends it. */
+  const replyWith = (change) => {
+    const payload = structuredClone(CV_PAYLOAD);
+    change(payload);
+    return JSON.stringify(payload);
+  };
+  /** The files of a LaTeX CV of a report of writeReport(), named after the candidate of the profile. */
+  const latexFiles = (report, slug = 'jane-smith') => {
+    const stem = `cv-${slug}-${report.stem}`;
+    return { stem, tex: `${stem}.tex`, json: `${stem}.json`, pdf: `${stem}.pdf` };
+  };
+  /** A data root with one report and the LaTeX CV a tailoring run in this process saved for it. */
+  const tailoredLatexRoot = async ({ reply = PAYLOAD_REPLY, profile, ...deps } = {}) => {
+    const root = makeRoot(profile ? { profile } : {});
+    const report = writeReport(root);
+    const result = await tailorCv('001', { cfg, client: fakeClient({ reply }), ui: quietUi().ui, dataRoot: root, format: 'latex', ...deps });
+    return { root, report, result, ...latexFiles(report) };
+  };
+  /** How the PDF of the compile stand-in begins, which neither Playwright's stand-in nor a real engine writes. */
+  const STAND_IN = '%PDF-1.7\n%LATEX_STAND_IN\n';
+  const asPattern = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  /** The compiles the stand-in was asked for, without the engine checks. */
+  const compiles = (run) => run.compiled.filter(({ call }) => call === 'compile');
+  /** A file's time set `ms` from now, so which of two files is the newer one does not hang on a clock tick. */
+  const touch = (path, ms) => utimesSync(path, new Date(Date.now() + ms), new Date(Date.now() + ms));
+  /** The .tex with a line of layout between its two jobs. */
+  const spaced = (tex) => {
+    const edited = tex.replace('\\cvEntrySep', '\\vspace{2pt}\n\\cvEntrySep');
+    assert.notEqual(edited, tex, 'the .tex has no \\cvEntrySep to put a line in front of');
+    return edited;
+  };
+  const DEFAULT_TEMPLATE = readFileSync(join(ROOT, 'lib', 'ollama-cv-latex-default.tex'), 'utf-8');
+  /** A template pack in a data root: data/templates/<name>/cv-latex.tex. */
+  const writePack = (root, name, text) => {
+    mkdirSync(join(root, 'data', 'templates', name), { recursive: true });
+    writeFileSync(join(root, 'data', 'templates', name, 'cv-latex.tex'), text);
+  };
+
+  test('tailor --latex --pdf asks for the engine before the model, compiles the .tex it saved, and indexes the PDF for the tracker', async () => {
+    const root = makeRoot();
+    const report = writeReport(root);
+    const { tex, json, pdf } = latexFiles(report);
+    await withStub({ reply: () => PAYLOAD_REPLY }, async (stub) => {
+      const run = await cli(['tailor', '001', '--latex', '--pdf', '--url', stub.url], { root, compile: { pages: 2 } });
+      assertExit(run, 0);
+      assert.equal(stub.generations().length, 1);
+      // The engine the default template names, before the request; then the .tex as it was saved, with no pack.
+      assert.deepEqual(run.compiled.map(({ call, engine }) => `${call} ${engine}`), ['version pdflatex', 'compile pdflatex']);
+      assert.equal(compiles(run)[0].packDir, null);
+      assert.equal(compiles(run)[0].tex, read(root, 'output', tex));
+      assert.deepEqual(listing(join(root, 'output')), [json, pdf, tex]);
+      assert.ok(read(root, 'output', pdf).startsWith(STAND_IN), 'the PDF is not the one the compile returned');
+      // The row generate-pdf.mjs writes for a PDF it delivers, with no source: column 2 is read as an HTML CV to render.
+      assert.deepEqual(pdfIndex(root), [['001', `output/${pdf}`, '', 'letter', TODAY, 'cv']]);
+      assert.match(run.stdout, new RegExp(`Tailored CV saved: output/${asPattern(tex)}[\\s\\S]*✅  PDF saved: output/${asPattern(pdf)}`));
+      assert.match(run.stderr, /^ {4}The next `npm run merge` ticks the PDF column of this report in the tracker\.$/m);
+      assert.doesNotMatch(run.stderr, /❌|⚠️|Next, the PDF/);
+    });
+  });
+
+  test('tailor --latex --pdf --json adds the PDF and its pages to the receipt', async () => {
+    const root = makeRoot();
+    const report = writeReport(root);
+    const { tex, json, pdf } = latexFiles(report);
+    await withStub({ reply: () => PAYLOAD_REPLY }, async (stub) => {
+      const run = await cli(['tailor', '001', '--latex', '--pdf', '--json', '--url', stub.url], { root, compile: { pages: 1 } });
+      assertExit(run, 0);
+      assert.equal(run.stdout.trim().split('\n').length, 1, run.stdout);
+      const receipt = JSON.parse(run.stdout);
+      assert.deepEqual(
+        [receipt.success, receipt.format, receipt.tex, receipt.payload, receipt.pdf, receipt.pages, receipt.factWarnings],
+        [true, 'latex', `output/${tex}`, `output/${json}`, `output/${pdf}`, 1, 0],
+      );
+    });
+
+    // A PDF over the page limit fails the command and keeps the CV, and the PDF before it.
+    writeFileSync(join(root, 'output', pdf), 'an earlier render');
+    await withStub({ reply: () => PAYLOAD_REPLY }, async (stub) => {
+      const run = await cli(['tailor', '001', '--latex', '--pdf', '--json', '--url', stub.url], { root, compile: { pages: 3 } });
+      assertExit(run, 1);
+      const receipt = JSON.parse(run.stdout);
+      assert.deepEqual([receipt.success, receipt.code, receipt.saved, receipt.tex, 'pdf' in receipt, 'pages' in receipt],
+        [false, 'PDF_NOT_WRITTEN', true, `output/${tex}`, false, false]);
+      assert.equal(read(root, 'output', pdf), 'an earlier render');
+      assert.deepEqual(pdfIndex(root), [['001', `output/${pdf}`, '', 'letter', TODAY, 'cv']]);
+    });
+  });
+
+  test('with --pdf, an engine that is not installed stops tailor before the model is asked, and nothing is written', async () => {
+    const root = makeRoot();
+    writeReport(root);
+    await withStub({ reply: () => PAYLOAD_REPLY }, async (stub) => {
+      const run = await cli(['tailor', '001', '--latex', '--pdf', '--json', '--url', stub.url], { root, compile: { fail: 'NO_ENGINE' } });
+      assertExit(run, 1);
+      assert.deepEqual(stub.requests, []);
+      const receipt = JSON.parse(run.stdout);
+      assert.deepEqual([receipt.success, receipt.code, receipt.saved], [false, 'NO_ENGINE', false]);
+      assert.deepEqual(run.compiled.map(({ call }) => call), ['version']);
+      assert.match(run.stderr, /^❌ {2}The template's engine, pdflatex, is not installed: pdflatex --version did not run\.$/m);
+      assert.match(run.stderr, /^ {4}Install pdflatex, or tailor without --pdf and compile the CV later\. Nothing was sent\.$/m);
+    });
+    assert.deepEqual(listing(join(root, 'output')), []);
+    assert.deepEqual(pdfIndex(root), []);
+  });
+
+  test('a compile that fails after the CV was saved keeps the .json and the .tex, writes no PDF, and says how to go on', async () => {
+    const root = makeRoot();
+    const report = writeReport(root);
+    const { tex, json } = latexFiles(report);
+    await withStub({ reply: () => PAYLOAD_REPLY }, async (stub) => {
+      const run = await cli(['tailor', '001', '--latex', '--pdf', '--json', '--url', stub.url], { root, compile: { fail: 'COMPILE' } });
+      assertExit(run, 1);
+      const receipt = JSON.parse(run.stdout);
+      assert.deepEqual(
+        [receipt.success, receipt.code, receipt.saved, receipt.tex, receipt.payload, 'pdf' in receipt],
+        [false, 'LATEX', true, `output/${tex}`, `output/${json}`, false],
+      );
+      assert.match(run.stderr, /^❌ {2}pdflatex stopped on pass 1 of 2 \(exit code 1\): ! Undefined control sequence\./m);
+      assert.ok(run.stderr.includes(`\n    The CV is kept: output/${tex}.\n    Fix the template or the .tex, then run: `
+        + `node ollama-runner.mjs pdf output/${tex}\n`), run.stderr);
+    });
+    assert.deepEqual(listing(join(root, 'output')), [json, tex]);
+    assert.deepEqual(pdfIndex(root), []);
+
+    // Out of time and no page count are failures of the compile too; an engine that is gone is one to install.
+    for (const [fail, code, next] of [
+      ['TIMEOUT', 'LATEX', 'Fix the template or the .tex'],
+      ['PAGES', 'LATEX', 'Fix the template or the .tex'],
+      ['NO_ENGINE', 'NO_ENGINE', 'Install pdflatex'],
+    ]) {
+      const run = await cli(['pdf', `output/${tex}`, '--json'], { root, compile: { fail } });
+      assertExit(run, 1, fail);
+      assert.equal(JSON.parse(run.stdout).code, code, fail);
+      assert.ok(run.stderr.includes(`\n    The CV is kept: output/${tex}.\n    ${next}, then run: node ollama-runner.mjs pdf output/${tex}\n`), run.stderr);
+    }
+    assert.deepEqual(listing(join(root, 'output')), [json, tex]);
+  });
+
+  test('a CV over the page limit leaves the earlier PDF as it was, writes only an .overflow draft, and never over another draft', async () => {
+    const { root, tex, json, pdf, stem } = await tailoredLatexRoot();
+    writeFileSync(join(root, 'output', pdf), 'an earlier render');
+    const run = await cli(['pdf', '001', '--latex', '--json'], { root, compile: { pages: 3 } });
+    assertExit(run, 1);
+    const receipt = JSON.parse(run.stdout);
+    assert.deepEqual([receipt.success, receipt.code, receipt.reason, 'pdf' in receipt],
+      [false, 'PDF_NOT_WRITTEN', 'The CV is 3 pages; the allowed maximum is 2.', false]);
+    assert.equal(read(root, 'output', pdf), 'an earlier render');
+    assert.ok(read(root, 'output', `${stem}.overflow.pdf`).startsWith(STAND_IN));
+    assert.deepEqual(pdfIndex(root), []);
+    assert.ok(run.stderr.includes(`\n    The CV is kept: output/${tex}.\n    The draft is kept: output/${stem}.overflow.pdf. Shorten the CV `
+      + `in output/${json}, then run: node ollama-runner.mjs pdf output/${json}\n`), run.stderr);
+
+    const again = await cli(['pdf', '001', '--latex'], { root, compile: { pages: 3 } });
+    assertExit(again, 1);
+    assert.ok(read(root, 'output', `${stem}.overflow-2.pdf`).startsWith(STAND_IN));
+    assert.equal(read(root, 'output', pdf), 'an earlier render');
+    assert.deepEqual(pdfIndex(root), []);
+    assert.doesNotMatch(run.stdout + again.stdout, /PDF saved/);
+  });
+
+  test('a CV the checks blocked is compiled by no route: pdf of its report and pdf of its .json stop with FACT_CHECK', async () => {
+    const invented = replyWith((payload) => { payload.experience[1].company = 'Lumenfield Analytics'; });
+    const { root, report, result, json, pdf } = await tailoredLatexRoot({ reply: invented, cfg: { ...cfg, retries: 0 } });
+    assert.deepEqual([result.success, result.code], [false, 'FACT_CHECK']);
+    assert.deepEqual(listing(join(root, 'output')), [json]);
+    for (const args of [['001', '--latex'], [`output/${json}`]]) {
+      const run = await cli(['pdf', ...args, '--json'], { root, compile: { pages: 1 } });
+      assertExit(run, 1, args.join(' '));
+      const receipt = JSON.parse(run.stdout);
+      assert.deepEqual(
+        [receipt.command, receipt.success, receipt.code, receipt.format, receipt.payload, 'tex' in receipt, 'pdf' in receipt],
+        ['pdf', false, 'FACT_CHECK', 'latex', `output/${json}`, false, false],
+        args.join(' '),
+      );
+      assert.equal(receipt.report, args[0] === '001' ? report.rel : undefined);
+      assert.match(run.stderr, /^❌ {2}The fact check blocks this CV: it states what cv\.md and article-digest\.md do not \(\d+ findings?\)\.$/m);
+      assert.match(run.stderr, /employer=lumenfield analytics/i);
+      assert.ok(run.stderr.includes(`\n    The CV is kept: output/${json}.\n    Change that in output/${json}, or add the evidence to cv.md `
+        + `or article-digest.md, then run: node ollama-runner.mjs pdf output/${json}\n`), run.stderr);
+      assert.deepEqual(run.compiled, [], 'something was compiled');
+    }
+    assert.deepEqual(listing(join(root, 'output')), [json]);
+    assert.ok(!existsSync(join(root, 'output', pdf)));
+    assert.deepEqual(pdfIndex(root), []);
+  });
+
+  test('pdf of a .json holds it to every check, link rule and order included, and repairs nothing', async () => {
+    const { root, tex, json } = await tailoredLatexRoot();
+    const saved = JSON.parse(read(root, 'output', json));
+    for (const [label, change, pattern] of [
+      ['a link none of the files holds', (payload) => { payload.projects.items[0].url = 'https://github.com/alexchen/fraudshield'; },
+        /^ {4}- a link to an address none of your files \(cv\.md, config\/profile\.yml, article-digest\.md\) holds: https:\/\/github\.com\/alexchen\/fraudshield$/m],
+      ['roles oldest first', (payload) => { payload.experience.reverse(); },
+        /^ {4}- CV work experience is not in reverse-chronological order: "2020-2024" appears after "2018-2020" but starts later\.$/m],
+      ['a skill cv.md does not have', (payload) => { payload.skills[2].items += ', OpenTelemetry'; }, /^ {4}- non-metric fact absent from sources: \S+=opentelemetry/im],
+    ]) {
+      const edited = structuredClone(saved);
+      change(edited);
+      writeFileSync(join(root, 'output', json), JSON.stringify(edited, null, 2));
+      const before = read(root, 'output', tex);
+      const run = await cli(['pdf', `output/${json}`, '--json'], { root, compile: { pages: 1 } });
+      assertExit(run, 1, label);
+      assert.equal(JSON.parse(run.stdout).code, 'FACT_CHECK', label);
+      assert.match(run.stderr, pattern, label);
+      assert.match(run.stderr, /^❌ {2}The (?:fact check blocks|checks block) this CV: /m, label);
+      // Neither file is changed: the .json is the owner's, and no .tex is written for a CV the checks block.
+      assert.equal(read(root, 'output', json), JSON.stringify(edited, null, 2), label);
+      assert.equal(read(root, 'output', tex), before, label);
+      assert.deepEqual(run.compiled, [], label);
+    }
+    // Not a payload: the reason is the one a reply is refused for.
+    const roleless = structuredClone(saved);
+    roleless.experience[0].role = '';
+    writeFileSync(join(root, 'output', json), JSON.stringify(roleless));
+    const broken = await cli(['pdf', `output/${json}`, '--json'], { root, compile: { pages: 1 } });
+    assertExit(broken, 1);
+    assert.equal(JSON.parse(broken.stdout).code, 'BAD_INPUT');
+    assert.match(broken.stderr, new RegExp(`^❌ {2}output/${asPattern(json)} is not a CV payload: experience\\[0\\] \\(TechFin Corp\\) has no role\\.$`, 'm'));
+    assert.deepEqual(pdfIndex(root), []);
+  });
+
+  test('pdf of a .json with a locked section changed stops with LOCKED_SECTIONS, and leaves both files as they were', async () => {
+    const profile = 'candidate:\n  full_name: "Jane Smith"\ncv:\n  locked_sections:\n    - "Work Experience"\n';
+    const { root, result, tex, json } = await tailoredLatexRoot({ profile });
+    assert.equal(result.success, true, result.reason);
+    const edited = JSON.parse(read(root, 'output', json));
+    edited.experience[1].blocks[0].bullets[1] = 'Implemented search ranking with learning-to-rank models at scale';
+    writeFileSync(join(root, 'output', json), JSON.stringify(edited));
+    const before = read(root, 'output', tex);
+    const run = await cli(['pdf', `output/${json}`, '--json'], { root, compile: { pages: 1 } });
+    assertExit(run, 1);
+    assert.equal(JSON.parse(run.stdout).code, 'LOCKED_SECTIONS');
+    assert.match(run.stderr, /^❌ {2}.*experience/im);
+    assert.ok(run.stderr.includes(`\n    The CV is kept: output/${json}.\n    The section is locked under cv.locked_sections in config/profile.yml: `
+      + `copy it from cv.md into output/${json}, then run: node ollama-runner.mjs pdf output/${json}\n`), run.stderr);
+    assert.equal(read(root, 'output', tex), before);
+    assert.equal(read(root, 'output', json), JSON.stringify(edited));
+    assert.deepEqual(run.compiled, []);
+  });
+
+  test('a template that cannot be used stops pdf of a .json with SETUP, before a .tex or a PDF is written', async () => {
+    const { root, json } = await tailoredLatexRoot();
+    const saved = JSON.parse(read(root, 'output', json));
+    rmSync(join(root, 'output', json.replace(/\.json$/, '.tex')));
+    // The template the .json names is not there; --template names one with a placeholder the renderer does not fill.
+    writeFileSync(join(root, 'output', json), JSON.stringify({ ...saved, template: 'gone' }));
+    writePack(root, 'awards', DEFAULT_TEMPLATE.replace('{{SKILLS}}', '{{SKILLS}}\n{{AWARDS}}'));
+    for (const [args, pattern] of [
+      [[], /^❌ {2}No template "gone": data\/templates\/gone\/cv-latex\.tex was not found\. Templates here: default, awards\.$/m],
+      [['--template', 'awards'], /^❌ {2}data\/templates\/awards\/cv-latex\.tex, line \d+: \{\{AWARDS\}\} is not a placeholder of a LaTeX CV\. Templates here: default, awards\.$/m],
+    ]) {
+      const run = await cli(['pdf', `output/${json}`, ...args, '--json'], { root, compile: { pages: 1 } });
+      assertExit(run, 1, args.join(' '));
+      assert.equal(JSON.parse(run.stdout).code, 'SETUP', args.join(' '));
+      assert.match(run.stderr, pattern, args.join(' '));
+      assert.ok(run.stderr.includes(`\n    The CV is kept: output/${json}.\n    Fix the template, or name another with --template, then run: `
+        + `node ollama-runner.mjs pdf output/${json}\n`), run.stderr);
+      assert.deepEqual(run.compiled, [], args.join(' '));
+    }
+    assert.deepEqual(listing(join(root, 'output')), [json]);
+    assert.deepEqual(pdfIndex(root), []);
+  });
+
+  test('a .tex may change the layout of its CV and never its text: an added \\vspace is compiled as it is, another employer is refused', async () => {
+    const { root, tex, json, pdf } = await tailoredLatexRoot();
+    const layout = spaced(read(root, 'output', tex));
+    writeFileSync(join(root, 'output', tex), layout);
+    const run = await cli(['pdf', `output/${tex}`], { root, compile: { pages: 1 } });
+    assertExit(run, 0);
+    assert.equal(compiles(run)[0].tex, layout);
+    assert.ok(read(root, 'output', pdf).startsWith(STAND_IN));
+    // A file named by its path is indexed under the report number in its name, as generate-pdf.mjs reads one.
+    assert.deepEqual(pdfIndex(root), [['001', `output/${pdf}`, '', 'letter', TODAY, 'cv']]);
+    assert.equal(read(root, 'output', tex), layout, 'the .tex given was changed');
+
+    rmSync(join(root, 'output', pdf));
+    writeFileSync(join(root, 'output', tex), layout.replace('{DataStartup Inc}', '{Lumenfield Analytics}'));
+    const changed = await cli(['pdf', `output/${tex}`, '--json'], { root, compile: { pages: 1 } });
+    assertExit(changed, 1);
+    assert.equal(JSON.parse(changed.stdout).code, 'FACT_CHECK');
+    assert.ok(changed.stderr.includes(`❌  The text of ${tex} is not the text of ${json}. Change the text in the .json and run pdf on it: `
+      + 'a .tex may change layout only.'), changed.stderr);
+    assert.match(changed.stderr, /^ {4}In the \.tex: \\cvEntryHead\{ML Engineer\}\{Lumenfield Analytics\}/m);
+    assert.match(changed.stderr, /^ {4}From the \.json: \\cvEntryHead\{ML Engineer\}\{DataStartup Inc\}/m);
+    assert.ok(changed.stderr.includes(`\n    The CV is kept: output/${tex}.\n    Change the text in output/${json}, then run: `
+      + `node ollama-runner.mjs pdf output/${json}\n`), changed.stderr);
+    assert.deepEqual(changed.compiled, []);
+    assert.ok(!existsSync(join(root, 'output', pdf)));
+    assert.equal(pdfIndex(root).length, 1);
+  });
+
+  test('a .tex without its .json beside it, or without the line that names its template, is refused', async () => {
+    const { root, tex, json } = await tailoredLatexRoot();
+    const saved = read(root, 'output', tex);
+    renameSync(join(root, 'output', json), join(root, json));
+    const alone = await cli(['pdf', `output/${tex}`, '--json'], { root, compile: { pages: 1 } });
+    assertExit(alone, 1);
+    assert.equal(JSON.parse(alone.stdout).code, 'BAD_INPUT');
+    assert.ok(alone.stderr.includes(`❌  pdf needs the payload of this .tex: ${json} was not found beside it.`), alone.stderr);
+    renameSync(join(root, json), join(root, 'output', json));
+
+    writeFileSync(join(root, 'output', tex), saved.slice(saved.indexOf('\n') + 1));
+    const unnamed = await cli(['pdf', `output/${tex}`, '--json'], { root, compile: { pages: 1 } });
+    assertExit(unnamed, 1);
+    assert.equal(JSON.parse(unnamed.stdout).code, 'BAD_INPUT');
+    assert.ok(unnamed.stderr.includes('❌  This .tex does not say which template it was made from: its first line must read '
+      + '% career-ops-latex: template=<name>.'), unnamed.stderr);
+    for (const run of [alone, unnamed]) {
+      assert.ok(run.stderr.includes(`\n    The CV is kept: output/${tex}.\n`), run.stderr);
+      assert.deepEqual(run.compiled, []);
+    }
+    assert.deepEqual(pdfIndex(root), []);
+  });
+
+  test('pdf of a report compiles its .tex when that is newer than its .json, and renders the .json again when it is not', async () => {
+    const { root, report, tex, json, pdf } = await tailoredLatexRoot();
+    const saved = read(root, 'output', tex);
+    const layout = spaced(saved);
+    writeFileSync(join(root, 'output', tex), layout);
+    touch(join(root, 'output', json), -60_000);
+    const newer = await cli(['pdf', '001', '--latex', '--json'], { root, compile: { pages: 2 } });
+    assertExit(newer, 0);
+    assert.deepEqual(JSON.parse(newer.stdout), {
+      command: 'pdf', success: true, format: 'latex', tex: `output/${tex}`, payload: `output/${json}`, report: report.rel,
+      pdf: `output/${pdf}`, pages: 2, factWarnings: 0,
+    });
+    assert.equal(compiles(newer)[0].tex, layout);
+
+    // The .json the newer file: the .tex is written from it again, and the hand-edited one kept as .bak.
+    touch(join(root, 'output', tex), -120_000);
+    const older = await cli(['pdf', '001', '--latex'], { root, compile: { pages: 1 } });
+    assertExit(older, 0);
+    assert.equal(compiles(older)[0].tex, saved);
+    assert.equal(read(root, 'output', tex), saved);
+    assert.equal(read(root, 'output', `${tex}.bak`), layout);
+    assert.ok(older.stderr.includes(`An earlier .tex of this CV was replaced. It is kept as output/${tex}.bak.`), older.stderr);
+    assert.deepEqual(pdfIndex(root), [['001', `output/${pdf}`, '', 'letter', TODAY, 'cv']]);
+    assert.match(older.stderr, /The next `npm run merge` ticks the PDF column/);
+  });
+
+  test('pdf of a .json anywhere writes its .tex and its PDF to output/ under its name, keyed by the report number in that name', async () => {
+    const { root, tex, json, pdf } = await tailoredLatexRoot();
+    const edited = JSON.parse(read(root, 'output', json));
+    // A change the checks have nothing against: the bullets of a job in another order.
+    edited.experience[0].blocks[0].bullets.reverse();
+    mkdirSync(join(root, 'drafts'));
+    writeFileSync(join(root, 'drafts', json), `${JSON.stringify(edited, null, 2)}\n`);
+    const run = await cli(['pdf', `drafts/${json}`, '--json'], { root, compile: { pages: 1 } });
+    assertExit(run, 0);
+    assert.deepEqual(JSON.parse(run.stdout), {
+      command: 'pdf', success: true, format: 'latex', tex: `output/${tex}`, payload: `drafts/${json}`, pdf: `output/${pdf}`, pages: 1,
+      factWarnings: 0,
+    });
+    const written = read(root, 'output', tex);
+    assert.equal(compiles(run)[0].tex, written);
+    const bullets = edited.experience[0].blocks[0].bullets;
+    assert.ok(written.indexOf('triggers}') < written.indexOf('(3 engineers)'), 'the .tex is not written from the edited .json');
+    assert.ok(bullets[0].endsWith('triggers'));
+    assert.deepEqual(listing(join(root, 'drafts')), [json]);
+    assert.equal(read(root, 'drafts', json), `${JSON.stringify(edited, null, 2)}\n`, 'the .json was rewritten');
+    assert.deepEqual(pdfIndex(root), [['001', `output/${pdf}`, '', 'letter', TODAY, 'cv']]);
+  });
+
+  test('a report with no number in its name gets its PDF, an index row with no report number, and no word about the tracker', async () => {
+    const root = makeRoot();
+    const report = writeReport(root);
+    const unnumbered = report.stem.replace(/^001-/, '');
+    renameSync(report.path, join(root, 'reports', `${unnumbered}.md`));
+    const ref = `reports/${unnumbered}.md`;
+    const tailored = await tailorCv(ref, { cfg, client: fakeClient({ reply: PAYLOAD_REPLY }), ui: quietUi().ui, dataRoot: root, format: 'latex' });
+    assert.equal(tailored.success, true, tailored.reason);
+    const pdf = `cv-jane-smith-${unnumbered}.pdf`;
+    const run = await cli(['pdf', ref, '--latex'], { root, compile: { pages: 1 } });
+    assertExit(run, 0);
+    assert.ok(read(root, 'output', pdf).startsWith(STAND_IN));
+    assert.deepEqual(pdfIndex(root), [['', `output/${pdf}`, '', 'letter', TODAY, 'cv']]);
+    assert.ok(run.stdout.includes(`✅  PDF saved: output/${pdf}`), run.stdout);
+    assert.doesNotMatch(run.stderr, /npm run merge/);
+  });
+
+  test('an HTML and a LaTeX CV of one report: pdf takes the format the flags and the profile choose, and the index keeps the PDF made last', async () => {
+    const { root, report, pdf } = await tailoredLatexRoot();
+    const html = await tailorCv('001', { cfg, client: fakeClient({ reply: CV_HTML }), ui: quietUi().ui, dataRoot: root, format: 'html' });
+    assert.equal(html.success, true, html.reason);
+    // The profile says html: the HTML CV, through generate-pdf.mjs, and no compile.
+    const asHtml = await cli(['pdf', '001'], { root, compile: { pages: 1 } });
+    assertExit(asHtml, 0);
+    assert.deepEqual(asHtml.compiled, []);
+    assert.ok(!read(root, 'output', pdf).includes('LATEX_STAND_IN'), 'generate-pdf.mjs did not render the PDF');
+    assert.deepEqual(pdfIndex(root), [['001', `output/${pdf}`, `output/${report.html}`, 'letter', TODAY, 'cv']]);
+    // --latex: the LaTeX CV of the same report, to the same PDF, which takes the row's place.
+    const asLatex = await cli(['pdf', '001', '--latex'], { root, compile: { pages: 1 } });
+    assertExit(asLatex, 0);
+    assert.equal(compiles(asLatex).length, 1);
+    assert.ok(read(root, 'output', pdf).startsWith(STAND_IN));
+    assert.deepEqual(pdfIndex(root), [['001', `output/${pdf}`, '', 'letter', TODAY, 'cv']]);
+
+    // cv.output_format: latex makes the LaTeX CV the one, and --html the HTML one all the same.
+    writeFileSync(join(root, 'config', 'profile.yml'), read(root, 'config', 'profile.yml').replace('output_format: "html"', 'output_format: "latex"'));
+    assert.match(read(root, 'config', 'profile.yml'), /output_format: "latex"/, 'the example profile no longer sets cv.output_format');
+    const byProfile = await cli(['pdf', '001'], { root, compile: { pages: 1 } });
+    assertExit(byProfile, 0);
+    assert.equal(compiles(byProfile).length, 1);
+    const overridden = await cli(['pdf', '001', '--html'], { root, compile: { pages: 1 } });
+    assertExit(overridden, 0);
+    assert.deepEqual(overridden.compiled, []);
+    assert.deepEqual(pdfIndex(root), [['001', `output/${pdf}`, `output/${report.html}`, 'letter', TODAY, 'cv']]);
+  });
+
+  test('what pdf cannot do with a LaTeX CV is refused before anything is read or compiled', async () => {
+    const { root, report, tex, json } = await tailoredLatexRoot();
+    touch(join(root, 'output', tex), 60_000);
+    const NOT_LATEX = '--template is for LaTeX CVs: add --latex, or set cv.output_format to latex in config/profile.yml.';
+    const PAPER_IN_TEX = '--format cannot be used with a .tex file: the paper size is written in it.';
+    const TEMPLATE_IN_TEX = '--template cannot be used with a .tex file: its first line names the template.';
+    for (const [args, reason, code = 'USAGE'] of [
+      [[`output/${json}`, '--latex'], '--latex cannot be used with a file: its extension names the format.'],
+      [[`output/${tex}`, '--html'], '--html cannot be used with a file: its extension names the format.'],
+      [[`output/${report.html}`, '--latex'], '--latex cannot be used with a file: its extension names the format.'],
+      [[`output/${tex}`, '--template', 'default'], TEMPLATE_IN_TEX],
+      [[`output/${report.html}`, '--template', 'default'], '--template cannot be used with an HTML file: it names the template of a LaTeX CV.'],
+      [[`output/${tex}`, '--format', 'a4'], PAPER_IN_TEX],
+      // The report's .tex is the newer file, so it is what `pdf 001 --latex` compiles.
+      [['001', '--latex', '--format', 'a4'], PAPER_IN_TEX],
+      [['001', '--latex', '--template', 'default'], TEMPLATE_IN_TEX],
+      [['001', '--latex', '--html'], '--latex cannot be used with --html: a CV is made in one format.'],
+      [['001', '--template', 'default'], NOT_LATEX],
+      [['output/missing.json'], 'LaTeX file not found: output/missing.json', 'BAD_INPUT'],
+      [['output/missing.tex'], 'LaTeX file not found: output/missing.tex', 'BAD_INPUT'],
+      [['007', '--latex'], 'Report not found: 007', 'BAD_INPUT'],
+    ]) {
+      const run = await cli(['pdf', ...args, '--json'], { root, compile: { pages: 1 } });
+      assertExit(run, 1, args.join(' '));
+      assert.deepEqual(JSON.parse(run.stdout), { command: 'pdf', success: false, reason, code }, args.join(' '));
+      assert.ok(run.stderr.includes(`❌  ${reason}`), run.stderr);
+      assert.deepEqual(run.compiled, [], args.join(' '));
+    }
+    assert.deepEqual(listing(join(root, 'output')), [json, tex]);
+    assert.deepEqual(pdfIndex(root), []);
+
+    // A report that has no LaTeX CV is told how to make one.
+    const bare = makeRoot();
+    writeReport(bare);
+    const none = await cli(['pdf', '001', '--latex'], { root: bare, compile: { pages: 1 } });
+    assertExit(none, 1);
+    assert.match(none.stderr, /❌ {2}No tailored LaTeX CV for reports\/001-northwind-robotics-\S+\.md in .+output\. Run first: node ollama-runner\.mjs tailor 001 --latex\n/);
+  });
+
+  test('with a template pack, the compile is handed the pack\'s folder and its engine; --template with a .json chooses another', async () => {
+    const root = makeRoot();
+    const report = writeReport(root);
+    const { tex, json, pdf } = latexFiles(report);
+    writePack(root, 'plain', DEFAULT_TEMPLATE.replace('%!TEX TS-program = pdflatex', '%!TEX TS-program = xelatex'));
+    await withStub({ reply: () => PAYLOAD_REPLY }, async (stub) => {
+      const run = await cli(['tailor', '001', '--latex', '--template', 'plain', '--pdf', '--url', stub.url], { root, compile: { pages: 1 } });
+      assertExit(run, 0);
+      assert.deepEqual(run.compiled.map(({ call, engine }) => `${call} ${engine}`), ['version xelatex', 'compile xelatex']);
+      assert.equal(compiles(run)[0].packDir, join(root, 'data', 'templates', 'plain'));
+      assert.ok(compiles(run)[0].tex.startsWith('% career-ops-latex: template=plain\n'));
+    });
+    assert.equal(JSON.parse(read(root, 'output', json)).template, 'plain');
+
+    // The .json names the pack; --template default renders it in the default template, with no pack and its engine.
+    const other = await cli(['pdf', `output/${json}`, '--template', 'default'], { root, compile: { pages: 1 } });
+    assertExit(other, 0);
+    assert.deepEqual(compiles(other).map(({ engine, packDir }) => [engine, packDir]), [['pdflatex', null]]);
+    assert.ok(read(root, 'output', tex).startsWith('% career-ops-latex: template=default\n'));
+    assert.ok(existsSync(join(root, 'output', pdf)));
+  });
+
+  test('a PDF the font left characters out of, and a build folder that stayed behind, are each said', async () => {
+    const { root, tex } = await tailoredLatexRoot();
+    const leftover = join(SANDBOX, 'career-ops-latex-left');
+    const run = await cli(['pdf', `output/${tex}`], { root, compile: { pages: 1, missingGlyphs: ['\u2192', 'U+2011'], leftover } });
+    assertExit(run, 0);
+    assert.ok(run.stderr.includes('⚠️   The PDF lacks these characters, which the template\'s font does not have: \u2192, U+2011.'), run.stderr);
+    assert.ok(run.stderr.includes(`⚠️   The build folder could not be removed: ${leftover}. It holds a copy of the CV.`), run.stderr);
+
+    // Said when the compile failed as well.
+    const failed = await cli(['pdf', `output/${tex}`], { root, compile: { fail: 'COMPILE', leftover } });
+    assertExit(failed, 1);
+    assert.ok(failed.stderr.includes(`⚠️   The build folder could not be removed: ${leftover}. It holds a copy of the CV.`), failed.stderr);
+  });
+
+  test('pdf of a .json the checks of its projection pass and the final text check blocks writes no .tex and no PDF, and says how to reword it', async () => {
+    // The line of the tailoring test of the final text check: true to cv.md,
+    // with a backslash in a list of tools after "using". The checks of the
+    // projection pass it; the final text check reads the .tex, where the
+    // backslash is written \textbackslash{}, and reads that as a tool.
+    const { root, tex, json, pdf } = await tailoredLatexRoot();
+    const line = 'Set up experiment tracking using MLflow and C:\\models\\registry paths';
+    writeFileSync(join(root, 'cv.md'), read(root, 'cv.md').replace('- Set up experiment tracking with MLflow and model versioning', `- ${line}`));
+    assert.ok(read(root, 'cv.md').includes(line), 'the example CV no longer has the bullet this test rewrites');
+    const edited = JSON.parse(read(root, 'output', json));
+    edited.experience[1].blocks[0].bullets[2] = line;
+    writeFileSync(join(root, 'output', json), JSON.stringify(edited, null, 2));
+    const before = read(root, 'output', tex);
+    const run = await cli(['pdf', `output/${json}`, '--json'], { root, compile: { pages: 1 } });
+    assertExit(run, 1);
+    const receipt = JSON.parse(run.stdout);
+    assert.deepEqual([receipt.success, receipt.code, receipt.payload, 'tex' in receipt, 'pdf' in receipt],
+      [false, 'FACT_CHECK', `output/${json}`, false, false]);
+    assert.match(run.stderr, /^❌ {2}The final text check blocks this CV: Fact check failed for /m);
+    assert.ok(run.stderr.includes('\n    The check misread an escaped character: reword that line in the .json.\n'
+      + `    The CV is kept: output/${json}.\n    Reword that in output/${json}, or add the evidence to cv.md or article-digest.md, `
+      + `then run: node ollama-runner.mjs pdf output/${json}\n`), run.stderr);
+    // The checks of the projection had nothing against it.
+    assert.doesNotMatch(run.stderr, /The (?:fact check blocks|checks block) this CV/);
+    assert.deepEqual(run.compiled, [], 'a CV the final text check blocks was compiled');
+    // No .tex is written from it: the one of the run before is as it was, and the .json as the owner left it.
+    assert.equal(read(root, 'output', tex), before);
+    assert.equal(read(root, 'output', json), JSON.stringify(edited, null, 2));
+    assert.ok(!existsSync(join(root, 'output', pdf)));
+    assert.deepEqual(pdfIndex(root), []);
+  });
+
+  test('a PDF whose row data/pdf-index.tsv cannot take is kept, and the run succeeds and says the tracker will not show it', async () => {
+    const { root, tex, pdf } = await tailoredLatexRoot();
+    // A folder where the index would be: it can be neither read nor replaced.
+    mkdirSync(join(root, 'data', 'pdf-index.tsv'));
+    const run = await cli(['pdf', `output/${tex}`, '--json'], { root, compile: { pages: 1 } });
+    assertExit(run, 0);
+    const receipt = JSON.parse(run.stdout);
+    assert.deepEqual([receipt.success, receipt.pdf, receipt.pages, receipt.factWarnings], [true, `output/${pdf}`, 1, 0]);
+    assert.ok(read(root, 'output', pdf).startsWith(STAND_IN), 'the PDF was not kept');
+    assert.match(run.stderr, new RegExp('^⚠️ {3}The PDF is saved, but data/pdf-index\\.tsv could not be updated \\(.+\\): the next '
+      + `\`npm run merge\` does not tick it in the tracker\\. Run node ollama-runner\\.mjs pdf output/${asPattern(tex)} again to record it\\.$`, 'm'));
+    // With no row written, the tracker is promised nothing, and no number is said to key one.
+    assert.doesNotMatch(run.stderr, /ticks the PDF column|No report number given/);
+    assert.ok(statSync(join(root, 'data', 'pdf-index.tsv')).isDirectory(), 'the folder in the place of the index was replaced');
+  });
+
+  test('a .tex or a PDF that cannot be saved fails pdf with SAVE or PDF_NOT_WRITTEN, keeps the CV, and indexes nothing', async () => {
+    const { root, tex, json, pdf } = await tailoredLatexRoot();
+    const saved = read(root, 'output', tex);
+    // A folder where the .tex would go: the write fails, as on a full disk or a file another program holds.
+    rmSync(join(root, 'output', tex));
+    mkdirSync(join(root, 'output', tex));
+    const noTex = await cli(['pdf', `output/${json}`, '--json'], { root, compile: { pages: 1 } });
+    assertExit(noTex, 1);
+    const unsaved = JSON.parse(noTex.stdout);
+    assert.deepEqual([unsaved.code, unsaved.payload, 'tex' in unsaved, 'pdf' in unsaved], ['SAVE', `output/${json}`, false, false]);
+    assert.match(noTex.stderr, new RegExp(`^❌ {2}Could not save output/${asPattern(tex)}: `, 'm'));
+    assert.ok(noTex.stderr.includes(`\n    The CV is kept: output/${json}.\n    Fix that, then run: node ollama-runner.mjs pdf output/${json}\n`),
+      noTex.stderr);
+    assert.deepEqual(noTex.compiled, [], 'a .tex that was not saved was compiled');
+
+    // The .tex back, and a folder where its PDF would go: compiled, then not saved.
+    rmSync(join(root, 'output', tex), { recursive: true });
+    writeFileSync(join(root, 'output', tex), saved);
+    mkdirSync(join(root, 'output', pdf));
+    const noPdf = await cli(['pdf', `output/${tex}`, '--json'], { root, compile: { pages: 1 } });
+    assertExit(noPdf, 1);
+    const unwritten = JSON.parse(noPdf.stdout);
+    assert.deepEqual([unwritten.code, unwritten.tex, unwritten.payload, 'pdf' in unwritten],
+      ['PDF_NOT_WRITTEN', `output/${tex}`, `output/${json}`, false]);
+    assert.match(noPdf.stderr, new RegExp(`^❌ {2}Could not save output/${asPattern(pdf)}: `, 'm'));
+    assert.ok(noPdf.stderr.includes(`\n    The CV is kept: output/${tex}.\n    Fix that, then run: node ollama-runner.mjs pdf output/${tex}\n`),
+      noPdf.stderr);
+    assert.equal(compiles(noPdf).length, 1);
+    // The atomic write takes its temporary file away again: output/ holds the CV and the folder, nothing half-written.
+    assert.deepEqual(listing(join(root, 'output')), [json, pdf, tex]);
+    assert.ok(statSync(join(root, 'output', pdf)).isDirectory());
+    assert.deepEqual(pdfIndex(root), []);
+  });
+
+  test('a row keyed by a number read from the PDF\'s name says which number and which name, unless the name is the one tailor gave that report\'s CV', async () => {
+    // The name tailor gave the CV of report 001, which tailor --latex says to run pdf on: the number is that report's own.
+    const { root, tex, pdf } = await tailoredLatexRoot();
+    const ownName = await cli(['pdf', `output/${tex}`], { root, compile: { pages: 1 } });
+    assertExit(ownName, 0);
+    assert.deepEqual(pdfIndex(root), [['001', `output/${pdf}`, '', 'letter', TODAY, 'cv']]);
+    assert.doesNotMatch(ownName.stderr, /⚠️|No report number given/);
+
+    // A report with no number of its own, and three digits in the name of its
+    // company: they key the row, which ticks whichever report has that number,
+    // so the run names the number and the file name it was read from.
+    const other = makeRoot();
+    const report = writeReport(other, { company: 'Northwind 360 Robotics' });
+    const unnumbered = report.stem.replace(/^001-/, '');
+    renameSync(report.path, join(other, 'reports', `${unnumbered}.md`));
+    const ref = `reports/${unnumbered}.md`;
+    const tailored = await tailorCv(ref, { cfg, client: fakeClient({ reply: PAYLOAD_REPLY }), ui: quietUi().ui, dataRoot: other, format: 'latex' });
+    assert.equal(tailored.success, true, tailored.reason);
+    const otherPdf = `cv-jane-smith-${unnumbered}.pdf`;
+    const guessed = await cli(['pdf', ref, '--latex'], { root: other, compile: { pages: 1 } });
+    assertExit(guessed, 0);
+    assert.deepEqual(pdfIndex(other), [['360', `output/${otherPdf}`, '', 'letter', TODAY, 'cv']]);
+    assert.ok(guessed.stderr.includes('⚠️   No report number given: the PDF\'s row in data/pdf-index.tsv takes report 360 from the file name '
+      + `"${otherPdf}".`), guessed.stderr);
+  });
+
+  test('the PDF of report 1000 or later, made from the .tex tailor names as the next step, is indexed under its report number', async () => {
+    // A number read from a file name is three digits, as generate-pdf.mjs reads
+    // one: the row of report 1000 had none, and the tracker never ticked it.
+    const root = makeRoot();
+    const report = writeReport(root, { num: '1000' });
+    const tailored = await tailorCv('1000', { cfg, client: fakeClient({ reply: PAYLOAD_REPLY }), ui: quietUi().ui, dataRoot: root, format: 'latex' });
+    assert.equal(tailored.success, true, tailored.reason);
+    const { tex, pdf } = latexFiles(report);
+    const run = await cli(['pdf', `output/${tex}`], { root, compile: { pages: 1 } });
+    assertExit(run, 0);
+    assert.deepEqual(pdfIndex(root), [['1000', `output/${pdf}`, '', 'letter', TODAY, 'cv']]);
+    assert.match(run.stderr, /^ {4}The next `npm run merge` ticks the PDF column of this report in the tracker\.$/m);
+    assert.doesNotMatch(run.stderr, /No report number given/);
+  });
+
+  test('right after tailor, a .tex written in the same tick as its .json is the file pdf of the report compiles', async () => {
+    // tailor writes the .json and then the .tex, and a file system with a
+    // coarse clock gives both one time: the .json was then taken for the
+    // newer, its .tex written again, and --template and --format accepted.
+    const { root, tex, json } = await tailoredLatexRoot();
+    const layout = spaced(read(root, 'output', tex));
+    writeFileSync(join(root, 'output', tex), layout);
+    const at = new Date(Date.now() - 60_000);
+    utimesSync(join(root, 'output', json), at, at);
+    utimesSync(join(root, 'output', tex), at, at);
+    const run = await cli(['pdf', '001', '--latex'], { root, compile: { pages: 1 } });
+    assertExit(run, 0);
+    assert.equal(compiles(run)[0].tex, layout);
+    assert.equal(read(root, 'output', tex), layout);
+    assert.ok(!existsSync(join(root, 'output', `${tex}.bak`)), 'the .tex was written again');
+    const refused = await cli(['pdf', '001', '--latex', '--template', 'default', '--json'], { root, compile: { pages: 1 } });
+    assertExit(refused, 1);
+    assert.equal(JSON.parse(refused.stdout).reason, '--template cannot be used with a .tex file: its first line names the template.');
+  });
+
+  test('a .json outside output/ that cannot be compiled or recorded names itself in the command to run again', async () => {
+    // Its .tex is written to output/, where no .json is beside it, and pdf of
+    // that .tex needs one with the same text: the command named was refused.
+    const { root, json, pdf } = await tailoredLatexRoot();
+    mkdirSync(join(root, 'drafts'));
+    writeFileSync(join(root, 'drafts', json), read(root, 'output', json));
+    const again = `node ollama-runner.mjs pdf drafts/${json}`;
+    for (const [fail, next] of [['COMPILE', 'Fix the template'], ['NO_ENGINE', 'Install pdflatex']]) {
+      const run = await cli(['pdf', `drafts/${json}`, '--json'], { root, compile: { fail } });
+      assertExit(run, 1, fail);
+      assert.ok(run.stderr.includes(`\n    ${next}, then run: ${again}\n`), run.stderr);
+    }
+    // A PDF that cannot be saved, and an index that cannot take its row.
+    mkdirSync(join(root, 'output', pdf));
+    const unsaved = await cli(['pdf', `drafts/${json}`, '--json'], { root, compile: { pages: 1 } });
+    assertExit(unsaved, 1);
+    assert.equal(JSON.parse(unsaved.stdout).code, 'PDF_NOT_WRITTEN');
+    assert.ok(unsaved.stderr.includes(`\n    Fix that, then run: ${again}\n`), unsaved.stderr);
+    rmSync(join(root, 'output', pdf), { recursive: true });
+    mkdirSync(join(root, 'data', 'pdf-index.tsv'));
+    const unindexed = await cli(['pdf', `drafts/${json}`], { root, compile: { pages: 1 } });
+    assertExit(unindexed, 0);
+    assert.ok(unindexed.stderr.includes(`does not tick it in the tracker. Run ${again} again to record it.`), unindexed.stderr);
+  });
+
+  test('with a template that shows years, pdf checks the dates as they print, on a .json and on a .tex, and a locked section with months stops it', async () => {
+    const { renderCvTex, readCvHeader } = await import('../lib/ollama-cv-latex.mjs');
+    const yearsPack = DEFAULT_TEMPLATE.replace('% career-ops-latex: dates=full', '% career-ops-latex: dates=year');
+    const root = makeRoot();
+    const report = writeReport(root);
+    const { tex, json, pdf } = latexFiles(report);
+    writePack(root, 'years', yearsPack);
+    // The check reads no date in "Dec 2021 (contract)"; the template prints 2018-2021, which cv.md's 2018-2020 contradicts.
+    const payload = { template: 'years', ...structuredClone(CV_PAYLOAD) };
+    payload.experience[1].dates = 'Jan 2018 – Dec 2021 (contract)';
+    mkdirSync(join(root, 'output'), { recursive: true });
+    writeFileSync(join(root, 'output', json), `${JSON.stringify(payload, null, 2)}\n`);
+    const fromJson = await cli(['pdf', `output/${json}`, '--json'], { root, compile: { pages: 1 } });
+    assertExit(fromJson, 1);
+    assert.equal(JSON.parse(fromJson.stdout).code, 'FACT_CHECK');
+    assert.match(fromJson.stderr, /employment-dates=datastartup inc: 2018.2021/);
+    // A .tex that is the text of that .json in that template is held to the same dates.
+    const header = readCvHeader(read(root, 'config', 'profile.yml'));
+    writeFileSync(join(root, 'output', tex), renderCvTex({ template: yearsPack, templateName: 'years', payload, header, paper: 'letter' }).tex);
+    const fromTex = await cli(['pdf', `output/${tex}`, '--json'], { root, compile: { pages: 1 } });
+    assertExit(fromTex, 1);
+    assert.equal(JSON.parse(fromTex.stdout).code, 'FACT_CHECK');
+    assert.match(fromTex.stderr, /employment-dates=datastartup inc: 2018.2021/);
+    assert.doesNotMatch(fromTex.stderr, /is not the text of/);
+    for (const run of [fromJson, fromTex]) assert.deepEqual(compiles(run), []);
+    assert.ok(!existsSync(join(root, 'output', pdf)));
+
+    // A locked experience section whose dates in cv.md carry months: printed in years, it is not cv.md's section.
+    const locked = makeRoot({ profile: 'candidate:\n  full_name: "Jane Smith"\ncv:\n  locked_sections:\n    - "Work Experience"\n' });
+    writeReport(locked);
+    writeFileSync(join(locked, 'cv.md'), read(locked, 'cv.md').replace('\n2018-2020', '\nJan 2018 - Dec 2020'));
+    writePack(locked, 'years', yearsPack);
+    const lockedPayload = { template: 'years', ...structuredClone(CV_PAYLOAD) };
+    lockedPayload.experience[1].dates = 'Jan 2018 - Dec 2020';
+    mkdirSync(join(locked, 'output'), { recursive: true });
+    writeFileSync(join(locked, 'output', json), JSON.stringify(lockedPayload));
+    const stopped = await cli(['pdf', `output/${json}`, '--json'], { root: locked, compile: { pages: 1 } });
+    assertExit(stopped, 1);
+    assert.equal(JSON.parse(stopped.stdout).code, 'LOCKED_SECTIONS');
+    assert.match(stopped.stderr, /Locked section 'experience' was modified during tailoring/);
+    assert.deepEqual(compiles(stopped), []);
   });
 });

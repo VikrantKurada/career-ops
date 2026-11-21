@@ -341,8 +341,8 @@ otherwise reads as its own operator.
 | `npm run ollama:scan` | Runs the portal scanner (`scan.mjs`) with the arguments you pass. New postings land in `data/pipeline.md`. | no |
 | `npm run ollama:eval -- <input>` | Evaluates one posting. Writes the report and a tracker row. | yes |
 | `npm run ollama:pipeline` | Evaluates the pending rows of `data/pipeline.md` one by one, ticks each row that succeeds, then merges the tracker. | yes |
-| `npm run ollama:tailor -- <report>` | Writes a tailored CV as HTML for one report, checked against `cv.md`. | yes |
-| `npm run ollama:pdf -- <report>` | Renders that HTML to PDF with `generate-pdf.mjs`. | no |
+| `npm run ollama:tailor -- <report>` | Writes a tailored CV for one report, checked against `cv.md`: as HTML, or with `--latex` as a `.json` of its text and a `.tex` made from it. | yes |
+| `npm run ollama:pdf -- <report>` | Renders that CV to PDF: an HTML CV with `generate-pdf.mjs`, a LaTeX CV with the TeX engine its template names. | no |
 | `npm run ollama:apply -- <report>` | Drafts application answers for one report. Never submits anything. | yes |
 | `npm run ollama:run -- <input>` | One posting end to end: evaluate, then tailor, PDF and answers if the score is high enough and the report does not advise against applying, then merge the tracker. | yes |
 | `npm run ollama -- <subcommand>` | The runner itself. `npm run ollama -- --help` prints the usage. | depends |
@@ -648,6 +648,7 @@ data root.
 | `--pdf` | Also render the PDF of that tailored CV. Implies `--tailor`. |
 | `--min-score X` | Threshold for `--tailor` and `--pdf`. Default 4.0. |
 | `--no-merge` | Leave the tracker rows in `batch/tracker-additions/`. |
+| `--latex`, `--html`, `--template <name>` | The format of the tailored CV, and the template of a CV in LaTeX: see [A CV in LaTeX](#a-cv-in-latex). Only with `--tailor` or `--pdf`. |
 
 What happens to a row:
 
@@ -700,8 +701,13 @@ so the exit code is 1 while one is pending. Evaluate the file with
 report, or the file you pass with `--jd <file>`. It writes
 `output/cv-<your-name>-<report-name>.html`. With `--pdf` it renders the PDF
 straight after. The HTML is not streamed to the terminal: a token counter
-shows that the model is writing, and the result is the file. The template is
-always `templates/cv-template.html`.
+shows that the model is writing, and the result is the file. The template of
+an HTML CV is always `templates/cv-template.html`.
+
+With `--latex` it makes the CV in LaTeX instead, in a template you can
+change. What follows describes the HTML CV, the default, as far as
+[A CV in LaTeX](#a-cv-in-latex), which says how a CV in LaTeX is made and
+checked, and where that differs.
 
 The model reads `cv.md`, the profile, the posting and the report. The report
 goes without five of its parts: the proposed CV changes (Block E), the
@@ -832,8 +838,8 @@ differs from the new one, for example because you edited it, it is kept as a
 `.bak` copy and the run says so. `ollama:apply` does the same with its answers
 file.
 
-`ollama:pdf` hands the HTML to `generate-pdf.mjs` and writes the PDF to
-`output/`. Besides a report it takes the path of an HTML file:
+For an HTML CV, `ollama:pdf` hands the HTML to `generate-pdf.mjs` and writes
+the PDF to `output/`. Besides a report it takes the path of an HTML file:
 `npm run ollama:pdf -- output/cv-<your-name>-<report-name>.html`. The paper
 size comes from your profile unless you pass `--format=letter` or
 `--format=a4`; for the other options of `generate-pdf.mjs`, run that script
@@ -856,6 +862,514 @@ The tracker's PDF column is ticked by the merge, not by the render:
 `merge-tracker.mjs` reads that record. So after `ollama:pdf` or
 `ollama:tailor --pdf`, run `npm run merge`. `ollama:pipeline` and
 `ollama:run` merge after the PDF, and their rows arrive ticked.
+
+#### A CV in LaTeX
+
+`npm run ollama:tailor -- 003 --latex` makes the CV for report 003 in LaTeX,
+in a template whose look you decide. The model is asked for the text of the
+CV as one JSON object, never for a line of LaTeX. One `\input` in a bullet
+would read a file into the PDF, and turning shell escape off does not stop
+that, so the runner writes every command around the text itself.
+
+This path is newer than the live rounds at the top of this page and was not
+part of them. Its tests use the stub server and a stand-in for the TeX
+engine, and one of them compiles the default template with the example CV
+in the real engine where one is installed.
+
+**Choosing the format and the template.** `--latex` or `--html` chooses the
+format. Without either, `cv.output_format` in `config/profile.yml` decides:
+`latex` makes LaTeX, anything else HTML. The runner makes no Markdown CV, so
+`text` makes HTML here. `--template <name>` chooses the template, else
+`cv.latex_template` in the profile, else `default`, which is
+`lib/ollama-cv-latex-default.tex`. Any other name is a template pack of your
+own: see [Writing a template pack](#writing-a-template-pack).
+
+```yaml
+cv:
+  output_format: latex   # optional: --latex does the same for one run
+  latex_template: mine   # optional: the pack in data/templates/mine/
+```
+
+With `cv.output_format: latex`, a CV made with `--html` is named by its file
+in the step after it,
+`Next, the PDF: node ollama-runner.mjs pdf output/cv-<your-name>-<report-name>.html`,
+and each `tailor` command that a run in HTML prints as a way on carries
+`--html`, so that it makes HTML again: under that profile, `pdf <report>`
+takes the report's LaTeX CV, and `tailor` alone makes one. In the same way,
+a `tailor` command that a run in LaTeX prints as a way on carries
+`--template <name>` when the run took a template the profile does not
+choose.
+
+`ollama:tailor`, `ollama:pdf` and `ollama:run` take the three options.
+`ollama:pipeline` takes them with `--tailor` or `--pdf`, and refuses them
+without either:
+`--latex needs --tailor or --pdf: it chooses the format of the tailored CV.`
+Two more refusals come before anything is sent:
+`--latex cannot be used with --html: a CV is made in one format.` and, for a
+CV that is not made in LaTeX,
+`--template is for LaTeX CVs: add --latex, or set cv.output_format to latex in config/profile.yml.`
+
+`cv.output_format` is career-ops' own key, and the agent modes read it too.
+Set to `latex`, it also sends an agent's `auto-pipeline` and `pipeline` to
+career-ops' own LaTeX path, `modes/latex.md`, where `build-cv-latex.mjs`
+fills `templates/cv-template.tex`. That path reads neither
+`cv.latex_template` nor your packs. To make LaTeX CVs with the runner alone,
+leave the key as it is and pass `--latex`. `cv.template` names an HTML
+template for career-ops' own tools, and the runner does not read it.
+
+**The header is the profile's.** The name, the title and the contact
+details come from `candidate` in `config/profile.yml`: `full_name`, `title`,
+`location`, `email`, `phone`, `linkedin` and `github`. The model is never
+asked for them. Without `full_name` the run stops before anything is sent:
+`config/profile.yml has no candidate.full_name: the CV header needs it.`
+A fact the profile leaves out is left out of the header.
+
+**Before the model is asked.** The template is found, checked and written
+once with no text, so a template the runner cannot use stops the run here.
+A CV in LaTeX has six sections: the summary, experience, projects,
+education, certifications and skills. Any other section under
+`cv.locked_sections` stops the run too, as in
+`cv.locked_sections names 'competencies', which a LaTeX CV has no section for. Remove it from the list, or tailor with --html.`
+With `--pdf`, the template's engine is asked for its version as well. Each
+of these ends the run with exit 1, before anything is sent or written.
+
+**The request and the reply.** The model reads what it reads for an HTML
+CV, with the same five parts of the report left out, and the request ends
+with the same rule. In place of `modes/pdf.md` and the HTML template it
+gets tailoring rules written for the JSON object, the object's schema, and
+the page budget, `cv.max_pages` (2 when unset). A reply in a code fence, or
+with a sentence before or after the object, is read all the same. A reply
+that is no such object is asked for once more: one cut off before its end,
+or one with a field of the wrong type, a job without a company, a role, or
+an intro or a bullet, a project without a name, a project address that is
+not a plain `http://` or `https://` link, an entry of the education without
+a degree or an institution, fewer than two sections with content, or too
+little of `cv.md`'s text. In every string, line breaks and tabs become
+spaces and invisible characters are removed (control characters, zero-width
+spaces, soft hyphens, bidi marks), so no spacing and no character the page
+does not show sets the text the checks read apart from the text that
+prints. A field that prints no bold (a role, a company, a location, dates, a
+project's name, a degree, an institution, a skills category and its items)
+also loses the `**` around a word, which `cv.md` writes around its titles and
+a model copies. No field prints italics, so every string but a project's
+address loses the underscores that mark them, as in `_LLM Eval Toolkit_`.
+An underscore inside a word, as in `feature_store`, beside a slash or a
+backslash, as in `docs/_draft_/cv.md`, or in an email address stays, as it
+does in an HTML CV. The `.json`, the checks and the `.tex` then hold the
+same words, except for a pair of underscores beside a backslash: it stays
+in the `.json` and the `.tex`, and the checks read it as italics. TeX itself
+still prints a few characters as others, which no check sees: see
+Characters, under Writing a template pack.
+
+**The checks.** The CV is also written as the plain HTML the checks of an
+HTML CV read, and goes through them, with the same functions: the locked
+sections, the link rule, and the fact check with its repair and its one
+more request. Its dates are the ones the template prints: for a template
+with `dates=year`, the years alone (see `dates=year` under Writing a
+template pack). One check comes earlier than for an HTML CV: the order of
+the jobs, newest first by start date. A reply out of that order is asked
+for again with that finding. The run lists the fact check's warnings
+itself, after `The fact check passes this CV with`, since no
+`generate-pdf.mjs` renders this CV to list them. The order of the sections
+is the template's.
+
+Then the runner writes the `.tex`, and for a CV those checks pass, the final
+text check of `generate-latex.mjs` reads it as text. It does not stand in
+for the checks above: in the macros the text is written in, it sees no
+employer, date, degree or skill. When it finds no `cv.md` it does not run,
+and says
+`The final text check did not run: cv.md was not found.`
+
+**What is written.** `output/cv-<your-name>-<report-name>.json` holds the
+text of the CV and the name of its template, and
+`output/cv-<your-name>-<report-name>.tex` is made from it. A file that
+differs from the one it replaces keeps the old one as a `.bak` copy. The run
+ends with
+`Next, the PDF: node ollama-runner.mjs pdf output/cv-<your-name>-<report-name>.tex`.
+With `--no-save` the `.tex` is printed and nothing is written. With `--pdf`
+as well, `--no-save` is refused:
+`--pdf cannot be used with --no-save: the PDF is compiled from the saved .tex.`
+
+A CV that the fact check, the order check or the final text check blocks
+is saved as its `.json` alone, and the run exits 1 with code `FACT_CHECK`:
+`The CV is kept for you to work on: output/cv-<your-name>-<report-name>.json. No .tex was written, and no PDF.`
+A `.tex` of an earlier run is left as it was. The ways on are those of a
+blocked HTML CV, with the `.json` in place of the HTML file. With
+`--no-save` no `.json` is written, so the way that edits it is left out, and
+the run says
+`Run without --no-save to keep a blocked CV as its .json, for you to edit.`
+When the final text check stops at a value with a backslash in it, the run
+adds
+`The check misread an escaped character: reword that line in the .json.`
+With `--no-save`, which writes no `.json`, it adds
+`The check misread an escaped character: reword that line.`
+
+A changed locked section saves nothing, not even the `.json`, asks the
+model no second time, and exits 1 with code `LOCKED_SECTIONS`, as for an
+HTML CV.
+
+With `--json` the receipt carries `"format": "latex"`, the two files under
+`tex` and `payload`, and `removed`, `rewritten`, `unlinked` and `factCheck`
+as for an HTML CV. The receipt of a blocked CV carries `payload` alone,
+since no `.tex` was written, and with `--no-save` the receipt carries the
+`.tex` under `text` and no file.
+
+**The PDF.** `--pdf` compiles the CV once it is saved, and `ollama:pdf`
+compiles it later. For a report, `ollama:pdf` takes the CV in the format the
+options and the profile choose, so with a profile that does not choose
+LaTeX it needs `--latex`. It also takes the path of the `.json` or of the
+`.tex`:
+
+```powershell
+npm run ollama:pdf -- 003 --latex
+npm run ollama:pdf -- output/cv-<your-name>-<report-name>.json
+npm run ollama:pdf -- output/cv-<your-name>-<report-name>.tex
+```
+
+For a report it compiles the `.tex` unless the `.json` is the newer of the
+two files, so right after `tailor`, which writes the `.tex` straight after
+the `.json`, it compiles the `.tex`, even when the file system gave both the
+same time. Once the `.json` is the newer, after you saved it, it works from
+the `.json`. With no CV in LaTeX for the report it says
+`No tailored LaTeX CV for` and the report, and names the `tailor` command to
+run first. A `.json` is written into its template again (`--template`, else
+the one the `.json` names, else the profile's), and the `.tex` it makes is
+saved in `output/` under the name of the `.json`, the old one kept as
+`.bak`. A `.tex` is compiled as it is: see Editing by hand, below. A path
+names its own format, so `--latex` and `--html` are refused with one
+(`--latex cannot be used with a file: its extension names the format.`),
+and with a `.tex` so are the two options it answers itself:
+`--template cannot be used with a .tex file: its first line names the template.`
+and
+`--format cannot be used with a .tex file: the paper size is written in it.`
+With a report, they are refused too when it is its `.tex` that is compiled,
+as right after `tailor`. To write that CV into another template, or on
+other paper, name its `.json` by its path, as the second command above
+does, and add the option. A path that leads to no file:
+`LaTeX file not found:` and the path.
+
+Whatever the route, the `.json` is checked again first, with its dates as
+the template prints them, and nothing in it is repaired or written back. A
+changed locked section, jobs out of order, a link to an address none of
+your files holds, or any finding of the fact check stops the command with
+exit 1 and no PDF. So nothing compiles a CV the checks block. Each of these
+failures, and each failure of the compile below, names the file that is
+kept, after `The CV is kept:`, and the command to run once it is mended.
+For a `.json` outside `output/`, that command names the `.json`: its `.tex`
+is written to `output/`, where no `.json` is beside it for `ollama:pdf` of
+that `.tex` to read.
+
+`ollama:run`, and `ollama:pipeline` with `--tailor` or `--pdf`, make each CV
+in the format the options and the profile choose, and compile its PDF the
+same way. With a PDF step, the engine is asked before each CV is asked for.
+
+**The compile.** The `.tex` is compiled in a folder of its own under the
+system's temporary folder, and the folder is removed afterwards. A template
+pack is copied in first. The engine is the one the template names, and
+`pdflatex` when it names none:
+
+| Engine | How it runs |
+|---|---|
+| `pdflatex`, `xelatex` | Found on PATH. Two passes, because the second prints what the first measured, each with shell escape off, `-interaction=nonstopmode` and `-halt-on-error`, and under MiKTeX with `-disable-installer`. |
+| `tectonic` | One call, with `--untrusted`: the copy `node install-latex-engine.mjs` puts beside the scripts when it is there, else the one on PATH. |
+| `lualatex` | Refused: `lualatex is not supported: it runs Lua code from the document. Use xelatex.` |
+
+Each call of the engine may take two minutes. **On MiKTeX**, which this
+machine has, a compile can install a package the document asks for and
+MiKTeX lacks, and can stop to ask first. The runner turns that off, so such
+a package stops the compile with the log's error line instead. Install it
+with the MiKTeX Console, then run `ollama:pdf` again. The packages of the
+default template are installed here.
+
+With `--pdf`, an engine that is not installed is found before the model is
+asked; `ollama:pdf` finds it when it compiles. The code is `NO_ENGINE`, and
+the reason names the engine and the line that chose it:
+`The template's engine, xelatex, is not installed: xelatex --version did not run. A template names its engine on the line %!TEX TS-program = xelatex (pdflatex when it has none).`
+A compile that stops has code `LATEX` and quotes the error lines of the
+log. The `.json` and the `.tex` stay, and the message ends with
+`Fix the template or the .tex` and the command to run again. For a `.json`
+outside `output/`, whose `.tex` the next `ollama:pdf` of that `.json` writes
+again, it ends with `Fix the template` and the command for the `.json`.
+When pdflatex has no way to print a character of the text, the reason adds
+`The template's engine cannot print that character: replace it in the .json, or use a template for xelatex.`
+
+**The page limit** is `cv.max_pages`, 2 when unset, as for an HTML CV. A
+CV that comes out longer is no PDF: the command exits 1 with code
+`PDF_NOT_WRITTEN` and a reason such as
+`The CV is 3 pages; the allowed maximum is 2.` Its pages are kept as a
+draft beside the PDF, `<name>.overflow.pdf`, then `<name>.overflow-2.pdf`
+and on, never over an earlier draft, and the message names the draft after
+`The draft is kept:`. A PDF made before stays as it was.
+
+A PDF that is delivered gets its row in `data/pdf-index.tsv`, where
+`generate-pdf.mjs` records its own, so the next `npm run merge` ticks the
+PDF column; `ollama:run` and `ollama:pipeline` merge after it. A PDF made
+from a file named by its path is recorded under the number of the report
+whose CV the file is by the name `tailor` gave it, however many digits the
+number has, and else under three digits in the file's name, as
+`generate-pdf.mjs` reads one. pdflatex and xelatex leave out a character
+the font has no glyph for, and exit 0 all the same. The run then says so, with
+`The PDF lacks these characters, which the template's font does not have:`
+and the characters. When the build folder cannot be removed, the run names
+it after `The build folder could not be removed:`. It holds a copy of the
+CV, so delete it yourself. With `--json`, the receipt of `ollama:pdf`
+carries `"format": "latex"`, `tex`, `payload`, `pdf`, `pages` and
+`factWarnings`.
+
+**Editing by hand.** The `.json` is the CV, and the place to change its
+text. Edit it and run `npm run ollama:pdf -- output/<name>.json`: it is read
+as a reply is read, checked as above, and never rewritten.
+
+A `.tex` may change the layout of its CV and never its text: a space, a
+font, a page break. While it is not older than its `.json`, it is the file
+`npm run ollama:pdf -- 003 --latex` compiles, and you can name it by its
+path as well. The runner writes the `.json` into the template the `.tex`
+names and compares the text of the two, call by call of the macros that
+carry text. A difference stops it with code `FACT_CHECK`:
+`The text of <name>.tex is not the text of <name>.json. Change the text in the .json and run pdf on it: a .tex may change layout only.`
+A `.tex` without its `.json` beside it is refused with code `BAD_INPUT`:
+`pdf needs the payload of this .tex: <name>.json was not found beside it.`
+So is one whose first line no longer names its template:
+`This .tex does not say which template it was made from: its first line must read % career-ops-latex: template=<name>.`
+The final text check reads the `.tex` as it is, and the engine is the one
+its header lines name.
+
+The comparison has a limit: it reads what the calls hold, not what the page
+prints. A `.tex` that redefines a macro in its preamble, or in its body
+under another spelling such as `\csname`, that puts a call inside
+`\iffalse ... \fi` with other text after it, or that adds a line of prose
+between two calls, compares as unchanged, and the final text check does not
+notice a changed employer, date, degree or skill. Change the text in the
+`.json` only, and read a `.tex` you edited before you send its PDF.
+
+For a report, `ollama:pdf` works from the `.tex` unless the `.json` is
+newer. `tailor` writes the `.tex` last, so it is the `.tex` until you save
+the `.json`: a `.json` saved after its `.tex` is written into the template
+again, over the `.tex`, which is kept as `.bak`. Tailoring the report again
+replaces both, keeping each as `.bak`. A layout you want in every CV belongs
+in a template pack.
+
+#### Writing a template pack
+
+A template decides how a CV in LaTeX looks: its fonts, its headings and
+their order, its spacing. The runner fills in the text, and writes no
+heading and no layout of its own. The built-in template,
+`lib/ollama-cv-latex-default.tex`, is a plain `article` for `pdflatex`. A
+pack is a template of your own, in a folder under your data root:
+
+```text
+data/templates/<name>/
+    cv-latex.tex      the template
+    ...               what it uses: a class, fonts, images
+```
+
+`<name>` is lower-case letters, digits and hyphens, and begins with a letter
+or a digit. `default` is the built-in template and has no folder. Choose a
+pack with `--template <name>`, or with `cv.latex_template: <name>` in the
+profile. `data/` is ignored by git, so a pack stays on your machine. The
+file is `cv-latex.tex`, not `cv-template.<name>.tex`: that is how
+career-ops' own CV templates are named, and `build-cv-latex.mjs` would try
+to fill it.
+
+Start from a copy of the default template, whose comments explain each part.
+With the data root in the checkout:
+
+```powershell
+New-Item -ItemType Directory -Force data\templates\mine | Out-Null
+Copy-Item lib\ollama-cv-latex-default.tex data\templates\mine\cv-latex.tex
+```
+
+With a `.json` from an earlier run, this compiles that CV in the pack
+without asking the model. It replaces that CV's `.tex`, kept as `.bak`, and
+its PDF:
+
+```powershell
+npm run ollama:pdf -- output/cv-<your-name>-<report-name>.json --template mine
+```
+
+For each compile the whole folder is copied beside the `.tex`, so
+`\documentclass{mycv}` finds `mycv.cls`, and a font or an image is found by
+its path inside the folder. A symbolic link in the pack is refused, and a
+`cv.pdf`, `cv.log` or `cv.aux` in it is left out of the copy. A template the
+runner cannot use is refused before the model is asked, with its file, its
+line and what is wrong. The reason ends with the templates there are, after
+`Templates here:`.
+
+**Header lines.** The comment lines before `\documentclass` set two things,
+each on a line of its own:
+
+- `%!TEX TS-program = xelatex` names the engine: `xelatex`, `pdflatex` or
+  `tectonic`, and `pdflatex` when no line names one. `% !TeX program =` is
+  read as well. `lualatex` is refused.
+- `% career-ops-latex: dates=year` shows only the years of each date, as
+  described below. `dates=full`, the default, shows dates as written.
+
+An option or a value the runner does not know, two options on one line and
+an option set twice are refused. Line 1 of every `.tex` the runner writes is
+`% career-ops-latex: template=<name>`, which `ollama:pdf` reads. A template
+does not carry that line.
+
+**Placeholders.** Each is filled in once, in a single pass, so a value that
+holds `{{` and `}}` stays text:
+
+| Placeholder | What it holds |
+|---|---|
+| `{{NAME}}` | `candidate.full_name`. |
+| `{{FIRST_NAME}}`, `{{LAST_NAME}}` | The name without its last word, and its last word. A name of one word is all `{{FIRST_NAME}}`, and `{{LAST_NAME}}` is empty. |
+| `{{TITLE}}`, `{{LOCATION}}`, `{{PHONE}}` | `candidate.title`, `candidate.location` and `candidate.phone`. |
+| `{{EMAIL}}`, `{{EMAIL_URL}}` | `candidate.email` as text, and as a `mailto:` address for `\href`. |
+| `{{LINKEDIN_DISPLAY}}`, `{{LINKEDIN_URL}}` | `candidate.linkedin` as text, without its scheme or a final slash, and as an address for `\href`. |
+| `{{GITHUB_DISPLAY}}`, `{{GITHUB_URL}}` | The same for `candidate.github`. |
+| `{{DATE}}` | The day the `.tex` is written, as `21 Nov 2026`. |
+| `{{PAPER}}` | `a4paper` or `letterpaper`: `page_format` in the profile, letter when it names neither, or `--format` of `ollama:pdf`. |
+| `{{SUMMARY}}`, `{{EXPERIENCE}}`, `{{PROJECTS}}`, `{{EDUCATION}}`, `{{CERTIFICATIONS}}`, `{{SKILLS}}` | The six sections, written in the macros below. |
+
+Every value is escaped for LaTeX, so an `_`, a `&` or a `%` in the profile
+prints as itself. An address goes through a cleaner for addresses instead.
+Any other placeholder refuses the template, as in
+`{{AWARDS}} is not a placeholder of a LaTeX CV.` So does a name in double
+braces written any other way, with spaces inside the braces, in lower case
+or with a digit, such as `{{ NAME }}`, `{{Name}}` or `{{PHONE2}}`: the runner
+would fill none of them, and each would print as its name. For one of the
+placeholders above in another spelling, the reason gives the one to write.
+A name begins with a letter or an underscore, so TeX code such as
+`\setlength{\parindent}{{0pt}}` is no placeholder. TeX code that holds such
+a name alone in double braces, such as `\def\x{{a}}`, reads as one and is
+refused: break its line after the two braces with a `%`, which TeX reads as
+the same code.
+
+**Blocks.** The lines from `%%IF KEY` to `%%END KEY` are left out when KEY
+has nothing to show, and the two marker lines are always removed. KEY is one
+of the six sections, `TITLE`, `LOCATION`, `EMAIL`, `PHONE`, `LINKEDIN` or
+`GITHUB`. Put each section's heading in its block, so that a section with
+nothing to show goes with its heading, and each contact detail in a block of
+its own, so that one the profile leaves out leaves no separator behind.
+Blocks may nest, and never cross. A key that is misspelt or never closed
+refuses the template.
+
+**Macros.** The sections are written as calls of eleven macros, one call to
+a line. The template defines all eleven in its preamble, and decides how
+each one looks:
+
+| Macro | What it is |
+|---|---|
+| `\cvSummary{text}` | A paragraph of the summary. |
+| `\cvEntryHead{role}{company}{location}{dates}` | A job. Its blocks follow it. |
+| `\cvEntryBlock{lead}{intro}{items}` | A group of bullets under a job: a title for the group, such as a product or a client; a sentence before the bullets; and the bullets, one `\cvItem` call to a line. |
+| `\cvItem{text}` | A bullet. |
+| `\cvEntrySep` | Between two jobs, and between two entries of the education. Never after the last. |
+| `\cvProjects{intro}{items}` | The projects: a sentence before them, and one `\cvProject` call to a line. |
+| `\cvProject{name}{url}{text}` | A project. The address is empty unless one of your files (`cv.md`, `config/profile.yml`, `article-digest.md`) holds it. |
+| `\cvEducation{degree}{institution}{dates}` | An entry of the education. |
+| `\cvCert{text}` | A certification. The default template lists them in an `itemize` that its body opens around `{{CERTIFICATIONS}}`. |
+| `\cvSkill{category}{items}` | A line of skills. The category comes without its colon. |
+| `\cvStop{.}` | Prints nothing: see below. |
+
+An empty argument is written `{}`, so a template can test for one, as the
+default template does with `\cvIfEmpty`. An argument that begins with `[`
+begins with `{[}` instead, so that a macro ending in `\item #1` does not
+read it as the label of the item. Bold, `**...**` in the JSON, is written
+`{\bfseries ...}`, in the summary, a lead, an intro, a bullet, a project's
+text and a certification, and nowhere else.
+
+**`\cvStop`.** Define it as `\newcommand{\cvStop}[1]{}`. The runner writes
+`\cvStop{.}` straight after each call of `\cvSummary`, `\cvEntryHead`,
+`\cvItem`, `\cvProject`, `\cvEducation`, `\cvCert` and `\cvSkill`. The final
+text check reads the `.tex` as text, and without a full stop there, a list of
+tools after "using" ran on into the next bullet, and a CV true to `cv.md`
+was blocked. Write `\cvStop{.}` after each heading of your template too, as
+the default template does.
+
+**Characters.** The runner writes `<`, `>`, `|`, the arrow (U+2192) and the
+plus-minus sign (U+00B1) as themselves, and a tilde as `\~{}`: written as
+commands, the final text check read them as names of tools. So the fonts of
+a template have to print them:
+
+- Under `pdflatex`, load `\usepackage[T1]{fontenc}` and
+  `\usepackage{lmodern}`: in pdflatex's own encoding, `<`, `>` and `|` print
+  as other characters. Declare the arrow with
+  `\DeclareUnicodeCharacter{2192}{\ensuremath{\rightarrow}}`. Declare the
+  tilde as well, or T1 prints `\~{}` as an accent, which the text layer of
+  the PDF, the part an applicant tracking system reads, gives as U+02DC:
+
+  ```latex
+  \ifcsname T1\string\~\endcsname
+    \makeatletter
+    \DeclareTextCompositeCommand{\~}{T1}{\@empty}{\textasciitilde}
+    \makeatother
+  \fi
+  ```
+
+  A character outside T1 that no line declares stops the compile, with the
+  hint quoted above.
+- Under `xelatex` or `tectonic`, which both run XeTeX, load `fontspec` and
+  an OpenType font, and declare nothing: `\~{}` prints a tilde there. Do not
+  load T1 under XeTeX, which finds no glyph past U+00FF in a T1 font and
+  leaves out the en dash and the arrow.
+
+The default template does both, by `\ifdefined\XeTeXrevision`.
+
+TeX also prints a few characters, and a few runs of them, as other
+characters, and the checks, which read the text before TeX does, never see
+that: `--` prints as an en dash, `---` as an em dash, `<<` and `>>` as
+guillemets, `,,` as a low double quote, and an apostrophe and a backquote
+as curly single quotes.
+Under XeTeX, whose fontspec turns on `Ligatures=TeX` for the main and the
+sans-serif font, a straight double quote prints as a closing curly quote as
+well, so every opening quote comes out as a closing one. These are TeX's
+ligatures. A bullet that names `--dry-run` passes every check and prints an
+en dash before `dry-run`, for the recruiter and for a parser alike, and so
+does a line of `cv.md` whose parts are joined with `--`. A pack that wants
+these characters printed as written turns the ligatures off: under XeTeX
+with `Ligatures=TeXOff` in the options of its fonts, and under pdflatex,
+where they are part of the font, with microtype's `\DisableLigatures`.
+
+**`dates=year`.** The dates of each job and of each entry of the education
+show their years only. A range shows its first year, an en dash and its
+last year, or the word that ends it: `Mar 2019 - Present` shows 2019 and
+Present. What follows that word is dropped, so
+`Mar 2020 - Present (promoted 2022)` shows 2020 and Present as well, not
+2022. A month before the last year, in any language and with a day or not,
+is no such word: `Jan 2018 - March 1, 2020` shows 2018 and 2020. So one word
+before a year is read as its month, unless it is a word for today, such as
+Present, now, heute or actualidad, in a language career-ops has modes for:
+`Mar 2020 - Present, 2022` shows 2020 and Present. A range within one year
+shows that year: `Feb 2017 - Nov 2017` shows as `2017`. A date is split
+once, at the first dash or `to` with a space on each side, or at a dash
+written straight after a year and before a word or a year. Two things
+cannot be told from the text. The words around a lone year are dropped:
+`Expected 2027` shows as `2027`, which reads as a degree finished. And a
+dash before two digits never splits, since `2011-12` is a month in ISO
+form, so the academic year `2019-20` shows as `2019`. Write such a date
+another way, or keep `dates=full`.
+
+The checks read the dates as the template prints them, so a year that
+`cv.md` contradicts is found, as in an HTML CV. That holds the locked
+sections to the printed dates too: the locked-section check compares the
+words of a section with `cv.md`'s, and a date that `cv.md` writes with a
+month or a remark prints without it. So a pack with `dates=year` cannot be
+used with a locked experience or education section, unless `cv.md` writes
+every date in that section the way it prints, as years and at most a word
+such as Present: otherwise the run, and `ollama:pdf`, stop with code
+`LOCKED_SECTIONS`, and nothing is saved or compiled.
+
+**babel.** If a pack loads babel, load it with `shorthands=off`, as in
+`\usepackage[shorthands=off,english]{babel}`. A language's shorthands turn
+characters of the text into commands: in German, `"a` prints as an a with
+an umlaut. The CV would then print something other than the text that was
+checked.
+
+**A pack is code.** The engine runs its class and preamble with your
+rights: it can read any file you can read and put it into the PDF, and it
+runs until the time limit. Use only packs you wrote or read. Shell escape is
+off for every engine, and pdflatex and xelatex install no package: the
+runner turns MiKTeX's installer off. tectonic can still download the files
+a document asks for from its online bundle. File reads are not restricted.
+What the runner keeps inert is the text it writes into a template: every
+value is escaped, and a value that would still hold a command stops the
+render with
+`The CV text would run a LaTeX command the renderer does not write:`. The
+template itself is not checked.
 
 ### `ollama:apply`
 
@@ -936,6 +1450,7 @@ posting typed as one short line of text.
 | `--questions <file>` | The form's questions, for the answers step. See [`ollama:apply`](#ollamaapply). A file that does not exist stops the run before the evaluation. |
 | `--min-score X` | Score the posting needs for the CV, the PDF and the answers. Default 4.0. |
 | `--no-merge` | Leave the tracker row in `batch/tracker-additions/`. |
+| `--latex`, `--html`, `--template <name>` | The format of the CV, and the template of a CV in LaTeX: see [A CV in LaTeX](#a-cv-in-latex). |
 
 A posting that scores below `--min-score` is evaluated, merged and left at
 that, with exit code 0. `--min-score` is the only score threshold here:
@@ -948,8 +1463,11 @@ tier No sponsorship, or a posting rated Suspicious. The run says
 `Stopping after the evaluation: the report advises against applying (...)`
 and prints the two commands that make the CV and the answers anyway,
 `node ollama-runner.mjs tailor <report> --pdf` and
-`node ollama-runner.mjs apply <report> --force`. No value of `--min-score`
-changes that.
+`node ollama-runner.mjs apply <report> --force`. For a CV in LaTeX the first
+of the two ends with `--latex`, followed by `--template <name>` when the run
+took a template the profile does not choose. For a CV in HTML under a
+profile that chooses LaTeX, it ends with `--html`. No value of
+`--min-score` changes that.
 
 One step that fails does not stop the others where they can still run. If the
 PDF cannot be rendered, the answers are still drafted. If the CV cannot be
@@ -1438,13 +1956,14 @@ privacy control. This fork does not make it.
 
 ## What still needs an agent CLI
 
-The runner covers scan, evaluate, pipeline, tailor, PDF and application
-answers. These parts of career-ops have no local path and still need an agent
-CLI such as Claude Code:
+The runner covers scan, evaluate, pipeline, tailoring the CV in HTML or in
+LaTeX, PDF and application answers. These parts of career-ops have no local
+path and still need an agent CLI such as Claude Code:
 
 | Feature | Why |
 |---|---|
 | Cover letters | `npm run cover-letter` only renders a finished JSON payload to PDF. The payload is written by an agent following `modes/cover.md`. |
+| A CV in career-ops' own LaTeX templates | `modes/latex.md` fills `templates/cv-template.tex`, and `modes/latex-tex.md` tailors a `.tex` you keep yourself, both through an agent. The runner's `--latex` writes into templates of its own: see [A CV in LaTeX](#a-cv-in-latex). |
 | Ranking the pipeline | `rank-pipeline.mjs` hands the work to an installed agent CLI. It has no HTTP path. |
 | Bulk tailoring | `batch-tailor.mjs` launches Claude Code and nothing else. Locally, `npm run ollama:pipeline -- --tailor --pdf` tailors as it evaluates, and `ollama:tailor` handles one existing report at a time. |
 | The web UI | `npm run ui` starts an agent CLI for every AI action. It has no Ollama engine. |
@@ -1543,7 +2062,7 @@ Add the fork's files by name. `git add -A` and `git commit -a` would also
 commit six files that are not the fork's, which the next section explains.
 
 ```powershell
-git add -- package.json .gitignore .env.example doctor.mjs docs/RUNNING_ON_A_BUDGET.md docs/SCRIPTS.md docs/PRIVACY.md docs/SUPPORTED_CLIS.md docs/OLLAMA.md config/local-paths.txt .claude/rules/ollama-fork.md ollama-runner.mjs lib/ollama-config.mjs lib/ollama-client.mjs lib/ollama-doctor.mjs tests/ollama-config.test.mjs tests/ollama-client.test.mjs tests/ollama-doctor.test.mjs tests/ollama-fork-guard.test.mjs tests/ollama-runner.test.mjs tests/ollama-runner-pipeline.test.mjs tests/ollama-runner-tailor.test.mjs tests/ollama-runner-steps.test.mjs tests/helpers/ollama-runner-eval-harness.mjs tests/helpers/ollama-runner-harness.mjs
+git add -- package.json .gitignore .env.example doctor.mjs docs/RUNNING_ON_A_BUDGET.md docs/SCRIPTS.md docs/PRIVACY.md docs/SUPPORTED_CLIS.md docs/OLLAMA.md config/local-paths.txt .claude/rules/ollama-fork.md ollama-runner.mjs lib/ollama-config.mjs lib/ollama-client.mjs lib/ollama-doctor.mjs lib/ollama-cv-latex.mjs lib/ollama-cv-latex-default.tex tests/ollama-config.test.mjs tests/ollama-client.test.mjs tests/ollama-doctor.test.mjs tests/ollama-fork-guard.test.mjs tests/ollama-runner.test.mjs tests/ollama-runner-pipeline.test.mjs tests/ollama-runner-tailor.test.mjs tests/ollama-runner-steps.test.mjs tests/ollama-cv-latex.test.mjs tests/helpers/ollama-runner-eval-harness.mjs tests/helpers/ollama-runner-harness.mjs
 ```
 
 ### The six skill files
@@ -1628,13 +2147,15 @@ target, and names that last line as the repair: a merge that stopped on a
 conflict is where the line gets left out.
 
 Everything else is new, and upstream has no file of the same name today: the
-runner (`ollama-runner.mjs`), its three modules (`lib/ollama-config.mjs`,
-`lib/ollama-client.mjs`, `lib/ollama-doctor.mjs`), `config/local-paths.txt`,
-the rule for agents (`.claude/rules/ollama-fork.md`), this page, and eight
-test suites under `tests/` (`ollama-config`, `ollama-client`, `ollama-runner`,
+runner (`ollama-runner.mjs`), its four modules (`lib/ollama-config.mjs`,
+`lib/ollama-client.mjs`, `lib/ollama-doctor.mjs`, `lib/ollama-cv-latex.mjs`),
+the default template of a CV in LaTeX (`lib/ollama-cv-latex-default.tex`),
+`config/local-paths.txt`, the rule for agents
+(`.claude/rules/ollama-fork.md`), this page, and nine test suites under
+`tests/` (`ollama-config`, `ollama-client`, `ollama-runner`,
 `ollama-runner-pipeline`, `ollama-runner-tailor`, `ollama-runner-steps`,
-`ollama-doctor` and `ollama-fork-guard`) with the two helpers they share,
-`tests/helpers/ollama-runner-eval-harness.mjs` and
+`ollama-cv-latex`, `ollama-doctor` and `ollama-fork-guard`) with the two
+helpers they share, `tests/helpers/ollama-runner-eval-harness.mjs` and
 `tests/helpers/ollama-runner-harness.mjs`.
 
 After a merge, check the result:
@@ -1647,7 +2168,7 @@ node test-all.mjs --only ollama
 node test-all.mjs --quick
 ```
 
-`--only ollama` runs the eight new suites and the four upstream suites for the
+`--only ollama` runs the nine new suites and the four upstream suites for the
 legacy script. The last command is the full gate and takes about three minutes
 here.
 
@@ -1661,11 +2182,15 @@ the number of upstream suites in the sentence before this one. A helper under
 message names the set and prints the entry as it has to be spelled.
 
 `doctor.mjs` loads the Ollama checks from `lib/ollama-doctor.mjs` only when it
-reaches them, so a merge or a commit that leaves one of the three
-`lib/ollama-*.mjs` files out does not break `npm run doctor`. In that state
+reaches them, so a merge or a commit that leaves out one of the three
+modules the checks use (`lib/ollama-doctor.mjs`, `lib/ollama-client.mjs`,
+`lib/ollama-config.mjs`) does not break `npm run doctor`. In that state
 `npm run doctor -- --ollama` reports
 `Ollama checks are not part of this checkout`, and
-`tests/ollama-fork-guard.test.mjs` fails on the missing file.
+`tests/ollama-fork-guard.test.mjs` fails on the missing file. The doctor
+never loads `lib/ollama-cv-latex.mjs`. Without it no runner command starts,
+and without `lib/ollama-cv-latex-default.tex` a CV in LaTeX in the default
+template is refused. The guard fails on either.
 
 On this machine a full run of untouched upstream code (`main` at `287c3e59`,
 283 commits after v1.40.0, run on 2026-11-17 with the six skill copies up to
@@ -1761,7 +2286,8 @@ git stash apply refs/backup-pre-update-wip/1.40.0
 
 What does protect the fork's files:
 
-- The four runner files and the rule for agents are declared in
+- The runner, its four modules, the default template of a CV in LaTeX and
+  the rule for agents are declared in
   [`config/local-paths.txt`](../config/local-paths.txt). No path the updater
   ships covers them today, so it does not write to them, declared or not. The
   declaration does two other things. It keeps

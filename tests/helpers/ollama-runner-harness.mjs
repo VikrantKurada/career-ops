@@ -7,7 +7,8 @@
 // seconds on one core, where test-all.mjs gives a suite it runs by itself 30.
 // Split in two, each half needs its own copy of everything below, so it lives
 // here: the fixtures, a stub that answers like Ollama, a stand-in for
-// Playwright, and `cli()`, which starts the runner as a child process.
+// Playwright, and `cli()`, which starts the runner as a child process, with a
+// stand-in for the compile of a LaTeX CV when a test asks for one.
 //
 // Importing this module prepares the process the way a suite needs it: it
 // creates the sandbox every data root lives in (removed when the suite ends),
@@ -215,6 +216,90 @@ function tailoredCv({
   ].join('\n');
 }
 const CV_HTML = tailoredCv();
+
+/** An object and everything in it, frozen, so a test that changes a fixture changes a copy of it (structuredClone()). */
+function deepFreeze(value) {
+  if (value && typeof value === 'object') {
+    for (const inner of Object.values(value)) deepFreeze(inner);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/**
+ * A tailored CV as a LaTeX run asks a model for it: the payload of
+ * lib/ollama-cv-latex.mjs, holding what examples/cv-example.md says, word for
+ * word, and nothing else. It is in the shape the payload is normalised to, so
+ * a run that keeps it as it came saves it as it is here.
+ */
+const CV_PAYLOAD = deepFreeze({
+  summary: [
+    'Full-stack AI engineer with 6 years building production ML systems. Led the ML platform at a Series B fintech (2020-2024), '
+      + 'scaling from 2 models to 15+ in production. Built real-time fraud detection (99.7% precision, $2M/year saved), '
+      + 'recommendation engine (18% uplift), and an internal MLOps platform serving 4 engineering teams.',
+  ],
+  experience: [
+    {
+      company: 'TechFin Corp',
+      role: 'Senior ML Engineer / ML Platform Lead',
+      location: 'Austin, TX',
+      dates: '2020-2024',
+      blocks: [{
+        lead: '',
+        intro: '',
+        bullets: [
+          'Led ML platform team (3 engineers), built internal MLOps tooling: model registry, A/B testing framework, feature store',
+          'Designed real-time fraud detection pipeline: Kafka → feature computation → model inference → decision engine. '
+            + '99.7% precision at 50ms p99',
+          'Built recommendation engine for lending products: collaborative filtering + LLM reranking. 18% conversion uplift',
+          'Reduced model deployment time from 2 weeks to 4 hours with CI/CD pipeline (GitHub Actions + SageMaker)',
+          'Established model monitoring: drift detection, performance dashboards (Grafana), automated retraining triggers',
+        ],
+      }],
+    },
+    {
+      company: 'DataStartup Inc',
+      role: 'ML Engineer',
+      location: 'Remote',
+      dates: '2018-2020',
+      blocks: [{
+        lead: '',
+        intro: '',
+        bullets: [
+          'Built NLP pipeline for document classification (BERT fine-tuning, 94% accuracy on legal docs)',
+          'Implemented search ranking with learning-to-rank models',
+          'Set up experiment tracking with MLflow and model versioning',
+        ],
+      }],
+    },
+  ],
+  projects: {
+    intro: '',
+    items: [
+      {
+        name: 'FraudShield',
+        text: '(Open Source) Real-time fraud detection framework. Kafka Streams + feature store + model serving. 500+ GitHub stars',
+        url: '',
+      },
+      {
+        name: 'LLM Eval Toolkit',
+        text: '(Open Source) Evaluation framework for LLM applications. Supports custom metrics, regression testing, CI integration',
+        url: '',
+      },
+    ],
+  },
+  education: [
+    { degree: 'MS Computer Science', institution: 'UT Austin', dates: '2018' },
+    { degree: 'BS Computer Science', institution: 'UC Berkeley', dates: '2016' },
+  ],
+  certifications: [],
+  skills: [
+    { category: 'ML/AI', items: 'PyTorch, TensorFlow, scikit-learn, Hugging Face, LangChain' },
+    { category: 'MLOps', items: 'SageMaker, MLflow, Kubeflow, Airflow, Feature Store' },
+    { category: 'Infra', items: 'Kubernetes, Kafka, Redis, PostgreSQL, AWS' },
+    { category: 'Languages', items: 'Python, Go, TypeScript, SQL' },
+  ],
+});
 
 // What the runner puts into the head of every CV it saves (withContentPolicy()).
 const CSP_META = '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; '
@@ -509,17 +594,54 @@ function cleanEnv() {
   )));
 }
 
-// main() with its page reader replaced: `pages` maps a URL to its text, and a
-// URL that is not in it reads like a posting that was taken down. The real
-// reader refuses the loopback addresses a test could serve a posting from.
+// main() with its seams replaced.
+//
+// The page reader, for `pages`: a map of a URL to its text, and a URL that is
+// not in it reads like a posting that was taken down. The real reader refuses
+// the loopback addresses a test could serve a posting from.
+//
+// The compile of a LaTeX CV, for `compile`: no TeX engine runs. The stand-in
+// returns a PDF of `pages` pages (`missingGlyphs` and `leftover` as a compile
+// reports them), or with `fail` the failure compileLatex() gives under that
+// code; its `engineProblem`, which the runner asks before the model, answers
+// NO_ENGINE for `fail: 'NO_ENGINE'` alone. Each call is appended to the file
+// RUNNER_TEST_COMPILE_LOG names, as one line of JSON, for cli() to hand back.
 const SEAM_DRIVER = `
+import { appendFileSync } from 'node:fs';
 import { main } from ${JSON.stringify(pathToFileURL(RUNNER).href)};
-const pages = JSON.parse(process.env.RUNNER_TEST_PAGES);
-const fetchPage = async (url) => {
-  if (!Object.hasOwn(pages, url)) throw new Error('No job description to evaluate at ' + url + ' (http_404)');
-  return pages[url];
-};
-process.exitCode = await main(JSON.parse(process.env.RUNNER_TEST_ARGV), { fetchPage });
+const seams = {};
+if (process.env.RUNNER_TEST_PAGES) {
+  const pages = JSON.parse(process.env.RUNNER_TEST_PAGES);
+  seams.fetchPage = async (url) => {
+    if (!Object.hasOwn(pages, url)) throw new Error('No job description to evaluate at ' + url + ' (http_404)');
+    return pages[url];
+  };
+}
+if (process.env.RUNNER_TEST_COMPILE) {
+  const compile = JSON.parse(process.env.RUNNER_TEST_COMPILE);
+  const record = (entry) => appendFileSync(process.env.RUNNER_TEST_COMPILE_LOG, JSON.stringify(entry) + '\\n');
+  const noEngine = (engine) => 'The template\\'s engine, ' + engine + ', is not installed: ' + engine + ' --version did not run.';
+  const reasons = {
+    NO_ENGINE: noEngine,
+    COMPILE: (engine) => engine + ' stopped on pass 1 of 2 (exit code 1): ! Undefined control sequence. l.42 \\\\cvBroken',
+    TIMEOUT: (engine) => engine + ' did not finish pass 1 of 2 within 120 s, and was stopped.',
+    PAGES: (engine) => engine + ' wrote a PDF, but neither cv.log nor cv.aux gives its number of pages.',
+  };
+  const leftover = compile.leftover ? { leftover: compile.leftover } : {};
+  seams.compileLatex = async ({ tex, packDir = null, engine } = {}) => {
+    record({ call: 'compile', engine, packDir, tex });
+    if (compile.fail) return { ok: false, code: compile.fail, reason: reasons[compile.fail](engine), ...leftover };
+    return {
+      ok: true, pdf: Buffer.from('%PDF-1.7\\n%LATEX_STAND_IN\\n%%EOF\\n'), pages: compile.pages ?? 1,
+      missingGlyphs: compile.missingGlyphs ?? [], engine, ...leftover,
+    };
+  };
+  seams.compileLatex.engineProblem = async (engine) => {
+    record({ call: 'version', engine });
+    return compile.fail === 'NO_ENGINE' ? { ok: false, code: 'NO_ENGINE', reason: noEngine(engine) } : null;
+  };
+}
+process.exitCode = await main(JSON.parse(process.env.RUNNER_TEST_ARGV), seams);
 `;
 
 /**
@@ -531,10 +653,14 @@ process.exitCode = await main(JSON.parse(process.env.RUNNER_TEST_ARGV), { fetchP
  * killed at the timeout.
  *
  * @param {string[]} args
- * @param {{root: string, cwd?: string, env?: object, pages?: Record<string, string>}} options
- *   `cwd` defaults to the data root, so no test reads a .env from wherever the suite was started.
+ * @param {{root: string, cwd?: string, env?: object, pages?: Record<string, string>,
+ *   compile?: {pages?: number, missingGlyphs?: string[], leftover?: string} | {fail: string, leftover?: string}}} options
+ *   `cwd` defaults to the data root, so no test reads a .env from wherever the suite was started. `compile` puts a
+ *   stand-in in place of the compile of a LaTeX CV (SEAM_DRIVER): `compiled` in the result is then what it was
+ *   asked, in order: `{ call: 'version', engine }` for the engine check the runner makes before the model, and
+ *   `{ call: 'compile', engine, packDir, tex }` for each compile.
  */
-function cli(args, { root, cwd = root, env = {}, pages } = {}) {
+function cli(args, { root, cwd = root, env = {}, pages, compile } = {}) {
   const childEnv = {
     ...cleanEnv(),
     CAREER_OPS_ROOT: root,
@@ -544,10 +670,15 @@ function cli(args, { root, cwd = root, env = {}, pages } = {}) {
     NODE_OPTIONS: `--import=${BROWSER_STAND_IN}`,
     ...env,
   };
-  const argv = pages ? ['--input-type=module', '-e', SEAM_DRIVER] : [RUNNER, ...args];
-  if (pages) {
-    childEnv.RUNNER_TEST_ARGV = JSON.stringify(args);
-    childEnv.RUNNER_TEST_PAGES = JSON.stringify(pages);
+  const seamed = Boolean(pages) || Boolean(compile);
+  const argv = seamed ? ['--input-type=module', '-e', SEAM_DRIVER] : [RUNNER, ...args];
+  if (seamed) childEnv.RUNNER_TEST_ARGV = JSON.stringify(args);
+  if (pages) childEnv.RUNNER_TEST_PAGES = JSON.stringify(pages);
+  // Outside the data root, so that no listing of it sees the record.
+  const compileLog = compile ? join(mkdtempSync(join(SANDBOX, 'compile-seam-')), 'calls.jsonl') : null;
+  if (compile) {
+    childEnv.RUNNER_TEST_COMPILE = JSON.stringify(compile);
+    childEnv.RUNNER_TEST_COMPILE_LOG = compileLog;
   }
   return new Promise((resolve) => {
     const child = execFile(process.execPath, argv, {
@@ -560,6 +691,9 @@ function cli(args, { root, cwd = root, env = {}, pages } = {}) {
         error: exited ? undefined : error,
         stdout,
         stderr,
+        compiled: compileLog && existsSync(compileLog)
+          ? readFileSync(compileLog, 'utf-8').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+          : [],
       });
     });
     child.stdin.end();
@@ -682,7 +816,7 @@ const WITHOUT_KEYWORDS = tailoredCv({ competencies: ['MLOps', 'Kafka'], infra: '
 const INFLATED_CV = tailoredCv({ summary: ' Cut inference cost by 73%.' });
 
 export {
-  ROOT, RUNNER, TODAY, SANDBOX, JD, reportBody, scoreSummary, goodReply, EDUCATION, tailoredCv, CV_HTML, CSP_META,
+  ROOT, RUNNER, TODAY, SANDBOX, JD, reportBody, scoreSummary, goodReply, EDUCATION, tailoredCv, CV_HTML, CV_PAYLOAD, CSP_META,
   asSaved, SAVED_CV, ANSWERS, applyMessage, REFUSAL, BLOCK_F, MODELS, TRACKER, makeRoot, writeReport, listing, read,
   isGeneration, asksFor, replies, withStub, cleanEnv, cli, assertExit, makeTailoredRoot, pdfIndex, trackerRow, ACME,
   GLOBEX, INITECH, PIPELINE, PAGES, SCORES, evaluationFor, makePipelineRoot, pendingUrls, fakeClient, quietUi,

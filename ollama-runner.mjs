@@ -44,6 +44,13 @@
  * rendered. The tracker is the same: an evaluation leaves an addition that
  * merge-tracker.mjs applies.
  *
+ * A CV in LaTeX (`tailor --latex`) is the exception. No script of upstream's
+ * renders the payload it is made from, so lib/ollama-cv-latex.mjs writes its
+ * .tex, and the checks generate-pdf.mjs makes on an HTML CV are made here, by
+ * the same functions, before anything is saved (checkCvPayload()), and again
+ * before its PDF is compiled (compileCvPdf()), which records the PDF in
+ * data/pdf-index.tsv as generate-pdf.mjs records its own.
+ *
  * WHAT IT DOES THAT ollama-eval.mjs DOES NOT
  * ------------------------------------------
  * Each item is something that went wrong, measured on this machine:
@@ -96,8 +103,15 @@ import {
   NO_INVENTED_PAY_RULE, alignDecisionToScore, normalizeEvaluationText, reportHasHardStop, reportIsSuspicious,
 } from './lib/eval-evidence.mjs';
 import { APPLY_MIN } from './lib/score-action.mjs';
-import { PAGE_FORMATS, normalizePageFormat } from './lib/page-format.mjs';
+import { PAGE_FORMATS, normalizePageFormat, resolvePageFormat } from './lib/page-format.mjs';
 import { loadYaml } from './lib/yaml-document.mjs';
+import { validateCvExperienceOrder } from './cv-experience-order.mjs';
+import { runLatexFactGate } from './generate-latex.mjs';
+import {
+  CV_PAYLOAD_SCHEMA, DEFAULT_LATEX_TEMPLATE, compileLatex, contentMacros, cvPayloadProblem, dropPayloadLinks, extractJsonObject,
+  latexEngineProblem, mapPayloadStrings, normalizeCvPayload, parseCvPayload, projectCvHtml, readCvHeader, readSkillsBack,
+  readTemplateOptions, renderCvTex, resolveLatexTemplate, sectionTitles, shownDatesFor, templateNameOf,
+} from './lib/ollama-cv-latex.mjs';
 import { locateApplyReport } from './apply-scope.mjs';
 import { installPiiInterceptor, redactModeEnabled } from './lib/pii-interceptor.mjs';
 import {
@@ -2052,9 +2066,32 @@ function printVerdict(ui, result) {
   ui.out(`${RULE}\n`);
 }
 
-/** How to make the CV and the answers for a report whose own advice stopped a run. */
-const afterStopHint = (reportNum) => `To make the CV and the answers anyway: \`node ollama-runner.mjs tailor ${reportNum} --pdf\` and `
-  + `\`node ollama-runner.mjs apply ${reportNum} --force\`.`;
+/**
+ * How to make the CV and the answers for a report whose own advice stopped a
+ * run. `cv` is the format and the template the run makes its CV in
+ * (`ctx.cv`), `byProfile` the ones the profile chooses (readCvFormat() with
+ * no flags), which is what `tailor` alone makes: a run that makes its CV in
+ * LaTeX names --latex, and --template when it took a template the profile
+ * does not choose; one that makes it in HTML under a profile that chooses
+ * LaTeX names --html.
+ *
+ * @param {string} reportNum
+ * @param {{format: 'html'|'latex', template?: string}} [cv]
+ * @param {{format: 'html'|'latex', template?: string}} [byProfile]
+ * @returns {string}
+ */
+const afterStopHint =(reportNum, cv = { format: 'html' }, byProfile = { format: 'html' }) => {
+  let flags = '';
+  if (cv.format === 'latex') {
+    flags = ' --latex';
+    if (cv.template !== undefined && cv.template !== byProfile.template) flags += ` --template ${shellWord(cv.template)}`;
+  } else if (byProfile.format === 'latex') {
+    flags = ' --html';
+  }
+  return 'To make the CV and the answers anyway: '
+    + `\`node ollama-runner.mjs tailor ${reportNum} --pdf${flags}\` and `
+    + `\`node ollama-runner.mjs apply ${reportNum} --force\`.`;
+};
 
 /** A command line that cannot be run as typed: say why, leave a receipt under --json, exit 1. */
 function refuse(ctx, reason, code = 'USAGE') {
@@ -2080,6 +2117,118 @@ function soleArgument(ctx) {
 // ---------------------------------------------------------------------------
 // tailor
 // ---------------------------------------------------------------------------
+
+/**
+ * The format a CV is made in, and the template of a LaTeX one, as the command
+ * line and the profile choose them: --latex or --html, else cv.output_format
+ * when it is exactly `latex`, else HTML; --template, else cv.latex_template,
+ * else the default template (lib/ollama-cv-latex-default.tex).
+ *
+ * Exactly `latex`, the one spelling validate-profile.mjs accepts. `text` asks
+ * the agent modes for a tailored CV in Markdown, which this runner does not
+ * make: it makes the HTML CV for it, as it always has.
+ *
+ * Never an error for the profile, so a command that is not about LaTeX does
+ * not fail on it: one that is missing, empty, does not parse or has no `cv`
+ * mapping chooses HTML and the default template, and loadCandidate() reports
+ * a missing profile where it always has.
+ *
+ * @param {Record<string, string|boolean>} [flags] Parsed options: `latex`, `html`, `template`.
+ * @param {string} [profileYmlText] The text of config/profile.yml.
+ * @returns {{format: 'latex'|'html', template: string}} `template` is a name as given, checked when it is used
+ *   (resolveLatexTemplate()).
+ * @throws {CommandLineError} For --latex with --html, and for --template on a CV that is not made in LaTeX.
+ */
+export function readCvFormat(flags = {}, profileYmlText = '') {
+  if (flags.latex && flags.html) throw new CommandLineError('--latex cannot be used with --html: a CV is made in one format.');
+  let cv = {};
+  try {
+    const profile = loadYaml(String(profileYmlText ?? ''));
+    if (profile?.cv && typeof profile.cv === 'object' && !Array.isArray(profile.cv)) cv = profile.cv;
+  } catch { /* a profile that does not parse chooses nothing */ }
+  const format = flags.latex || (!flags.html && cv.output_format === 'latex') ? 'latex' : 'html';
+  if (flags.template !== undefined && format !== 'latex') {
+    throw new CommandLineError('--template is for LaTeX CVs: add --latex, or set cv.output_format to latex in config/profile.yml.');
+  }
+  // A value that is not text is passed on as its JSON, for
+  // resolveLatexTemplate() to judge by name: a number keeps its digits, which
+  // can name a pack, and a list or a mapping is refused (`[plain]` is
+  // `["plain"]`, which String() made plain). An empty one is no choice.
+  const named = cv.latex_template;
+  let fromProfile = '';
+  if (typeof named === 'string') fromProfile = named.trim();
+  else if (named !== null && named !== undefined) {
+    try {
+      fromProfile = JSON.stringify(named) ?? '';
+    } catch {
+      fromProfile = `[${typeof named}]`; // a value that refers to itself through a YAML alias
+    }
+  }
+  return { format, template: flags.template ?? (fromProfile || DEFAULT_LATEX_TEMPLATE) };
+}
+
+/**
+ * The text of config/profile.yml for readCvFormat(): '' when there is none or
+ * it cannot be read, for loadCandidate() to report as it always has.
+ */
+function profileText(workspace) {
+  try {
+    return existsSync(workspace.profileYml) ? readFileSync(workspace.profileYml, 'utf-8') : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * The format and the template the profile alone chooses for a CV
+ * (readCvFormat() with no flags): the ones `tailor`, `run`, `pipeline` and
+ * `pdf <report>` make or take without --latex, --html or --template. A
+ * command a run prints for a CV in the other format, or in another template,
+ * names that flag.
+ *
+ * @param {ReturnType<typeof openWorkspace>} workspace
+ * @returns {{format: 'latex'|'html', template: string}}
+ */
+const profileCvChoice = (workspace) => readCvFormat({}, profileText(workspace));
+
+/**
+ * The format the profile alone chooses for a CV (profileCvChoice()).
+ *
+ * @param {ReturnType<typeof openWorkspace>} workspace
+ * @returns {'latex'|'html'}
+ */
+const profileCvFormat = (workspace) => profileCvChoice(workspace).format;
+
+/**
+ * The sections of a LaTeX CV, as the locked-section check names them: the six
+ * of the payload. A section cv.md has and the payload has not (competencies,
+ * awards, one of the owner's own) could never read as unchanged.
+ */
+const LATEX_SECTION_KEYS = Object.freeze(['summary', 'experience', 'projects', 'education', 'certifications', 'skills']);
+
+/** Why a LaTeX CV is neither made nor compiled with `key` in cv.locked_sections: a section its payload has not. */
+const unplacedLockedSection = (key) => `cv.locked_sections names '${key}', which a LaTeX CV has no section for. Remove it from the `
+  + 'list, or tailor with --html.';
+
+/**
+ * The pages a CV may fill: cv.max_pages in the profile, else 2, read as
+ * generate-pdf.mjs reads it (pageBudgetFor()). For a LaTeX CV, which no
+ * generate-pdf.mjs renders: the budget its prompt asks the model to keep to,
+ * and the limit its compiled PDF is held to.
+ *
+ * @param {ReturnType<typeof openWorkspace>} workspace
+ * @returns {Promise<{ok: true, maxPages: number} | {ok: false, reason: string}>} `reason` without the sentence of
+ *   generate-pdf.mjs on what to do, which names two options of its own that this runner does not have.
+ */
+async function readCvPageLimit(workspace) {
+  try {
+    const [{ pageBudgetFor }, { readCvPageBudget }] = await Promise.all([import('./generate-pdf.mjs'), import('./theme-style.mjs')]);
+    const { maxPages } = pageBudgetFor('cv', { maxPages: 2, maxPagesSupplied: false, strictPages: false }, readCvPageBudget(workspace.profileYml));
+    return { ok: true, maxPages };
+  } catch (err) {
+    return { ok: false, reason: String(err?.message ?? err).split(/(?<=\.)\s+/).filter((sentence) => !sentence.includes('--max-pages')).join(' ') };
+  }
+}
 
 let cvChecks;
 /**
@@ -2446,6 +2595,187 @@ function factCheckFeedback(findings) {
   ].join('\n');
 }
 
+/**
+ * What a second request for a CV in LaTeX is told about the first: the
+ * findings of the fact check in factCheckFeedback()'s measured words, and a
+ * finding of the order check (checkCvPayload(), key `experience-order`) in
+ * words of its own. Under the fact check's sentence it read as a thing cv.md
+ * and article-digest.md do not contain, which it is not, and "do not name
+ * them" puts no job in its place.
+ *
+ * @param {Array<{key: string, text: string}>} findings
+ * @returns {string}
+ */
+function payloadCheckFeedback(findings) {
+  const order = findings.filter(({ key }) => key === 'experience-order');
+  const facts = findings.filter(({ key }) => key !== 'experience-order');
+  const parts = facts.length > 0 ? [factCheckFeedback(facts)] : [];
+  // A drift finding is a clause that opens with a verb its source sentence
+  // does not use. On real runs it was most often two sentences of one cv.md
+  // bullet joined with a semicolon, which "do not name them" does not repair:
+  // the words are all cv.md's. The sentence says what does.
+  if (facts.some(({ text }) => text.includes('drift='))) {
+    parts[0] += '\n\nWhere a line above says a clause opens with a word its source bullet does not use, copy the sentences of '
+      + 'that cv.md bullet as cv.md writes them: one sentence each, each opening with its own verb, never two joined with a '
+      + 'semicolon or a comma.';
+  }
+  if (order.length > 0) {
+    parts.push([
+      'An earlier draft of this CV was rejected because its jobs are not newest first by start date:',
+      ...order.map(({ text }) => `- ${text}`),
+      '',
+      'Write the CV again with the jobs in reverse-chronological order: the job that started last comes first.',
+    ].join('\n'));
+  }
+  return parts.join('\n\n');
+}
+
+/**
+ * The tailoring rules of a request for a CV in LaTeX: the rules of
+ * modes/pdf.md that are about the text of a CV, condensed and written for the
+ * payload (lines 13, 60-62, 64-65, 108, 137-138, 143-144, 156-161, 183-189,
+ * 310-316 and 324-326 of that file).
+ *
+ * The order of the jobs is the one the order check holds a CV to
+ * (validateCvExperienceOrder()): newest first by start date. "The order cv.md
+ * gives them", as the rule read, is that order only when cv.md keeps it, and a
+ * CV that kept a cv.md listing a later role second was blocked.
+ *
+ * Not modes/pdf.md itself. That file is written for an agent with tools: its
+ * steps run scripts and write files under /tmp, and its "JSON Input Schema"
+ * is the payload of build-cv-html.mjs, in which education has `title`, `org`
+ * and `year` and a line forbids the `degree`, `institution` and `dates` this
+ * payload has. Sent whole beside CV_PAYLOAD_SCHEMA, it would give the model
+ * two schemas that contradict each other.
+ */
+const LATEX_TAILOR_RULES = [
+  '1. Locked sections: a section that cv.locked_sections in config/profile.yml names is copied from cv.md word for word. '
+    + 'Never remove, shorten or paraphrase it.',
+  '2. Summary: rewrite it for this posting, with the keywords of the job description and the candidate\'s exit narrative '
+    + '(narrative.exit_story in config/profile.yml, when it is filled in), adapted to the target role. Never invent an exit or '
+    + 'founder story.',
+  '3. Projects: select the three or four projects most relevant to the posting.',
+  '4. Bullets: reorder the bullets of each job by relevance to the posting, the strongest matching evidence first. Tailor '
+    + 'through the summary and the choice and order of bullets, never by moving a job: the jobs stay in reverse-chronological '
+    + 'order, newest first by start date.',
+  '5. Keywords: inject the keywords of the job description naturally into achievements cv.md already states. Never invent one. '
+    + 'A legitimate reformulation: the job description says "RAG pipelines" and cv.md says "LLM workflows with retrieval", so '
+    + 'the CV says "RAG pipeline design and LLM orchestration workflows". Never add a skill the candidate does not have: a '
+    + 'swapped or mapped term must mean the same thing and be backed by the same role, never broadening the candidate\'s scope.',
+  '6. Six-second test: the summary and the first bullets make the target role, the strongest fit and its proof obvious.',
+  '7. Placement: the keywords of the posting go into the summary (the top five), the first bullet of each job and the skills. '
+    + 'No hidden text and no keyword stuffing: the CV is read by a parser and by a person.',
+  '8. Recruiter review: the summary answers "What role is this person targeting, and why this one?"; the first lines show one '
+    + 'or two proof points that map to the posting\'s riskiest requirements; bullets emphasise outcomes, systems, users or '
+    + 'business effects, not a history of tasks; location, work authorisation, salary and availability belong in the CV only '
+    + 'when the market and the profile call for them.',
+  '9. Sections: the template writes the headings (Professional Summary, Work Experience, Projects, Education, Certifications, '
+    + 'Skills) and drops a section that has nothing to show, heading included. Leave such a section empty.',
+  '10. Bold: wrap a few words in **double asterisks** to emphasise them, typically the quantified result a recruiter should '
+    + 'catch in a six-second scan: "Cut p99 latency from 840 ms to **120 ms** across 14 services". A bold span cannot contain '
+    + 'an asterisk. Bold reorders attention and adds no claim, and bolding every other phrase emphasises nothing.',
+  '11. Sentences: copy each sentence of a cv.md bullet as cv.md writes it, opening with its own verb. Never join two '
+    + 'sentences with a semicolon or a comma, and never move a verb from one sentence to another: the fact check compares '
+    + 'each clause with the cv.md sentence it comes from.',
+].join('\n');
+
+/**
+ * Build the two messages that ask for a tailored CV in LaTeX: the text of the
+ * CV as one JSON object (CV_PAYLOAD_SCHEMA), never a line of LaTeX, which
+ * the runner writes itself.
+ *
+ * Its inputs are buildTailorPrompt()'s, taken the same way: cv.md, the
+ * profile and the report without its archive and its own model's claims
+ * (reportForModel()), each redacted when the profile asks for that, and the
+ * user message ends with NO_TOOLS_NOTE, TAILOR_GROUNDING_NOTE and the
+ * feedback of a second request, in that order: those two notes are the
+ * measured part of the HTML request. What differs is the instruction: the
+ * modes' writing rules, LATEX_TAILOR_RULES, the schema and the page budget in
+ * place of modes/pdf.md and the HTML template.
+ *
+ * @param {{shared: string, writing: string}} files modes/_shared.md and modes/_writing.md.
+ * @param {{cv: string, profileYml: string}} candidate
+ * @param {string} reportText
+ * @param {string} jdText
+ * @param {{maxPages: number}} budget The pages the CV may fill (cv.max_pages, else 2).
+ * @param {string} [feedback]
+ * @returns {{system: string, user: string}}
+ */
+function buildLatexTailorPrompt(files, candidate, reportText, jdText, { maxPages }, feedback = '') {
+  const cvContent = redactIfEnabled(candidate.cv, candidate.profileYml);
+  const profileContent = redactIfEnabled(candidate.profileYml, candidate.profileYml);
+  const reportContent = redactIfEnabled(reportForModel(reportText, { archive: false }), candidate.profileYml);
+  const pages = `${maxPages} page${maxPages === 1 ? '' : 's'}`;
+
+  const system = `You are career-ops, an AI-powered CV tailoring engine.
+You read a candidate's base CV, profile, an evaluation report, and a Job Description.
+Your job is to apply strict anti-fabrication tailoring rules and return the text of the tailored CV as one JSON object.
+
+═══════════════════════════════════════════════════════
+SYSTEM CONTEXT (_shared.md)
+═══════════════════════════════════════════════════════
+${files.shared}
+
+═══════════════════════════════════════════════════════
+WRITING GUARDRAILS (_writing.md)
+═══════════════════════════════════════════════════════
+${files.writing}
+
+═══════════════════════════════════════════════════════
+CV TAILORING RULES
+═══════════════════════════════════════════════════════
+${LATEX_TAILOR_RULES}
+
+═══════════════════════════════════════════════════════
+${CV_PAYLOAD_SCHEMA}
+
+═══════════════════════════════════════════════════════
+PAGE BUDGET
+═══════════════════════════════════════════════════════
+The CV is printed on at most ${pages}. Select for that: keep the evidence that matters most for this posting, and leave out what matters least. Never pad the CV to fill the pages.
+
+═══════════════════════════════════════════════════════
+CANDIDATE BASE CV & PROFILE
+═══════════════════════════════════════════════════════
+[cv.md]
+${cvContent}
+
+[config/profile.yml]
+${profileContent}
+
+═══════════════════════════════════════════════════════
+IMPORTANT OPERATING RULES FOR THIS SESSION
+═══════════════════════════════════════════════════════
+1. NEVER invent skills, metrics, or experience the candidate does not have.
+2. Inject keywords naturally by reformulating the real experience using JD vocabulary.
+3. Apply the 6-second clarity gate: strongest matching evidence first.
+4. Your final output MUST be the one JSON object the CV PAYLOAD section describes, and nothing else.
+5. Do NOT wrap it in a code fence, write LaTeX, HTML or Markdown other than **bold**, or add conversational filler.`;
+
+  const user = `EVALUATION REPORT:\n\n${reportContent}\n\nJOB DESCRIPTION:\n\n${jdText}\n\n`
+    + 'Now, write the tailored CV as the one JSON object described above. Output ONLY the JSON object.'
+    + `\n\n${NO_TOOLS_NOTE}\n\n${TAILOR_GROUNDING_NOTE}`
+    + (feedback ? `\n\n${feedback}` : '');
+  return { system, user };
+}
+
+/**
+ * Why a reply cannot be read as a CV payload, or null when it can: the
+ * reasons of cvPayloadProblem(), which another attempt may not have, so the
+ * request goes again. Redaction tokens in the payload are thrown, as for an
+ * HTML CV: the next reply would carry them too.
+ *
+ * @param {string} reply
+ * @param {number} minTextChars The text a CV has to carry, the HTML path's share of cv.md (cvExpectations()).
+ * @returns {string|null}
+ * @throws {Error} Code REDACTED_REPLY.
+ */
+function latexReplyProblem(reply, minTextChars) {
+  const json = extractJsonObject(reply);
+  if (json !== null) refuseRedactionTokens(json);
+  return cvPayloadProblem(reply, { minTextChars });
+}
+
 /** Where a reply opens an HTML document: an <html> tag with the head or the body straight after it. */
 const HTML_OPENING_SOURCE = String.raw`<html\b[^>]*>(?:\s|<!--(?:(?!-->)[\s\S])*-->)*<(?:head|body)\b`;
 
@@ -2673,6 +3003,24 @@ function cvExpectations(template, candidate) {
 }
 
 /**
+ * Stop at a CV that came back with the tokens PRIVACY_REDACT=1 puts into a
+ * request in place of the owner's details. Thrown, not returned as a reason:
+ * the next reply would carry them too, so asking again changes nothing.
+ *
+ * @param {string} text The CV as it would be saved: an HTML document, or the JSON object of a payload.
+ * @throws {Error} Code REDACTED_REPLY.
+ */
+function refuseRedactionTokens(text) {
+  const token = REDACTION_TOKEN_RE.exec(text);
+  if (!token) return;
+  throw Object.assign(new Error(
+    `The CV came back with ${token[0]} where one of your details belongs. PRIVACY_REDACT=1 replaces the values listed in `
+    + 'config/privacy.yml with such tokens on the way out, and they are not put back into a reply that is read as a stream. '
+    + 'Tailor the CV without PRIVACY_REDACT.',
+  ), { code: 'REDACTED_REPLY' });
+}
+
+/**
  * Why a reply cannot be saved as a tailored CV, or null when it can.
  *
  * A reason returned here is one another attempt may not have, so the request
@@ -2695,14 +3043,7 @@ export function tailoredCvProblem(reply, expect = {}) {
   if ([...text.matchAll(new RegExp(HTML_OPENING_SOURCE, 'gi'))].length > 1) return 'the reply holds more than one HTML document';
   const html = extractHtmlDocument(text);
   if (!html) return 'the reply is not a complete HTML document';
-  const token = REDACTION_TOKEN_RE.exec(html);
-  if (token) {
-    throw Object.assign(new Error(
-      `The CV came back with ${token[0]} where one of your details belongs. PRIVACY_REDACT=1 replaces the values listed in `
-      + 'config/privacy.yml with such tokens on the way out, and they are not put back into a reply that is read as a stream. '
-      + 'Tailor the CV without PRIVACY_REDACT.',
-    ), { code: 'REDACTED_REPLY' });
-  }
+  refuseRedactionTokens(html);
   // Comments are left out of this check: the template's own stylesheet names
   // a slot in two of them ("the {{PHOTO}} slot is empty"), and a model that
   // keeps the stylesheet as it came has filled in everything it was asked to.
@@ -3228,7 +3569,149 @@ function writeKeepingPrevious(path, content) {
 }
 
 /**
- * Tailor the CV to one evaluated posting and save it as HTML.
+ * What a tailored CV is checked with, in either format, made ready before the
+ * model is asked: the checks of generate-pdf.mjs, the sections the profile
+ * locks (each of which cv.md has to have), and the fact check, run once on
+ * nothing. With them, the text the link rule reads and the titles of the
+ * sections of a payload's projection (sectionTitles()).
+ *
+ * @param {ReturnType<typeof openWorkspace>} workspace
+ * @param {{cv: string, profileYml: string}} candidate
+ * @returns {Promise<{ok: true, checks: object, lockedKeys: string[], factTools: Parameters<typeof checkCvFacts>[1],
+ *   ownText: string, titles: ReturnType<typeof sectionTitles>, cv: string}
+ *   | {ok: false, reason: string, code: string, hints?: string[]}>} `ownText` is cv.md, the profile and
+ *   article-digest.md as text; `cv` is cv.md, which the locked sections are compared with.
+ */
+async function loadCvCheckTools(workspace, candidate) {
+  let checks;
+  try {
+    checks = await loadCvChecks();
+  } catch (err) {
+    return { ok: false, reason: `Could not load the CV checks of generate-pdf.mjs: ${err.message}`, code: 'SETUP' };
+  }
+  let lockedKeys;
+  try {
+    lockedKeys = checks.readLockedSections(workspace.profileYml, checks.sectionKey);
+  } catch (err) {
+    return { ok: false, reason: `Could not read the locked sections of the CV: ${err.message}`, code: 'SETUP' };
+  }
+  const missing = missingLockedSection(checks, candidate.cv, lockedKeys);
+  if (missing) return { ok: false, reason: missing, code: 'SETUP', hints: ['Fix cv.locked_sections in config/profile.yml. Nothing was sent.'] };
+
+  // The fact check, run once on nothing: a config/cv-facts.json it cannot
+  // use is found now and not after two minutes of generation.
+  let factTools;
+  try {
+    const gate = await loadFactGate();
+    factTools = {
+      gate, checks, inputs: factGateInputs(workspace),
+      ownWords: `${candidate.cv}\n${gate.candidateOwnWords(workspace.dataRoot)}`,
+    };
+    checkCvFacts('', factTools);
+  } catch (err) {
+    return { ok: false, reason: `The fact check cannot run: ${err.message}`, code: 'SETUP', hints: ['Nothing was sent.'] };
+  }
+
+  // What a link in the CV may point to: an address one of the candidate's
+  // own files holds. Read from the files as they are, not as the model saw them.
+  const digestPath = join(workspace.dataRoot, 'article-digest.md');
+  const ownText = [candidate.cv, candidate.profileYml, existsSync(digestPath) ? readFileSync(digestPath, 'utf-8') : ''].join('\n');
+  return { ok: true, checks, lockedKeys, factTools, ownText, titles: sectionTitles(candidate.cv, checks.sectionKey), cv: candidate.cv };
+}
+
+/**
+ * Check a CV payload where an HTML CV is checked, and with `repair` repair it
+ * as an HTML CV is repaired.
+ *
+ * The checks read HTML, so the payload is written as the plain HTML they read
+ * (projectCvHtml()), which is never rendered. On it, in the order of the HTML
+ * path: the sections the profile locks, which have to read as cv.md has them
+ * (a change is thrown with `lockedSection: true`, as there); the order of the
+ * roles, which generate-pdf.mjs refuses to render unless it is newest first
+ * by start date (validateCvExperienceOrder(), which reads the CV alone and
+ * never cv.md), as a finding that blocks (`experience-order`); the link rule;
+ * then the fact check, with the repair of the entries it rejects when
+ * `repair` is set.
+ * What the link rule and the repair took out of the HTML is read back into
+ * the payload (dropPayloadLinks(), readSkillsBack()), since the .tex is
+ * written from the payload. That payload is projected and checked once more,
+ * and that verdict is the one returned: a read-back that differed from the
+ * HTML the repair checked cannot pass for it.
+ *
+ * The dates are projected as the template prints them (`shownDates`, from
+ * shownDatesFor() of the template in use), so each check reads the dates
+ * that print: a template that sets dates=year prints the years alone, and a
+ * year cv.md contradicts, or a locked section without its months, reached
+ * the PDF while the checks read the dates as written. The payload returned
+ * keeps them as written.
+ *
+ * @param {unknown} payload
+ * @param {Extract<Awaited<ReturnType<typeof loadCvCheckTools>>, {ok: true}>} tools
+ * @param {{repair?: boolean, shownDates?: (dates: string) => string}} [options]
+ * @returns {{payload: ReturnType<typeof normalizeCvPayload>, html: string, check: ReturnType<typeof checkCvFacts>,
+ *   removed: Array<{where: string, text: string, item?: string}>,
+ *   rewritten: Array<{where: string, from: string, to: string, item: string}>, unlinked: string[]}}
+ *   `html` is the projection of the payload returned; `unlinked` the addresses taken off, as the payload had them.
+ * @throws {Error} With `lockedSection: true` for a locked section that changed. An error of the fact check is thrown
+ *   as it is.
+ */
+function checkCvPayload(payload, tools, { repair = false, shownDates } = {}) {
+  const cv = normalizeCvPayload(payload);
+  const projection = projectCvHtml(cv, tools.titles, { shownDates });
+  try {
+    tools.checks.validateLockedSections(projection, tools.cv, tools.lockedKeys);
+  } catch (err) {
+    throw Object.assign(new Error(String(err?.message ?? err)), { lockedSection: true });
+  }
+  let order = null;
+  try {
+    validateCvExperienceOrder(projection);
+  } catch (err) {
+    // Its first sentence. The rest names a flag of generate-pdf.mjs that this runner does not have.
+    order = { key: 'experience-order', text: String(err?.message ?? err).split(/(?<=\.)\s+(?=[A-Z])/)[0] };
+  }
+  const linked = withoutUnsupportedLinks(projection, tools.ownText);
+  const { payload: unlinkedPayload, dropped } = dropPayloadLinks(cv, linked.html);
+  const repaired = repair ? repairCvFacts(linked.html, tools.factTools) : { html: linked.html, removed: [], rewritten: [] };
+  const checked = readSkillsBack(repaired.html, unlinkedPayload);
+  const html = projectCvHtml(checked, tools.titles, { shownDates });
+  const facts = checkCvFacts(html, tools.factTools);
+  const check = order ? { ...facts, verdict: 'block', findings: [order, ...facts.findings] } : facts;
+  return { payload: checked, html, check, removed: repaired.removed, rewritten: repaired.rewritten, unlinked: dropped };
+}
+
+/**
+ * Say what the link rule and the repair of the fact check changed in a
+ * tailored CV: the links taken off, the lists written without brackets, the
+ * entries removed. The same lines for a CV in either format.
+ */
+function noteCvRepairs(ui, { unlinked, rewritten, removed }) {
+  if (unlinked.length > 0) {
+    const one = unlinked.length === 1;
+    ui.note(`🔗  ${unlinked.length} link${one ? '' : 's'} taken off the CV, because ${one ? 'its address is' : 'their addresses are'} in `
+      + `none of your files (cv.md, config/profile.yml, article-digest.md): ${unlinked.join(', ')}.`);
+    ui.note(`    The text ${one ? 'it was' : 'they were'} on stays. If the address is right, add it to cv.md and tailor again.`);
+  }
+  if (rewritten.length > 0) {
+    // Nothing was lost here, and nothing is missing from the candidate's
+    // files: the check read a list in brackets item by item.
+    ui.note(`✏️   Written without brackets, because the fact check reads a list in brackets item by item and rejected a piece of `
+      + `it: ${rewritten.map(({ where, from, to, item }) => `"${from}" is now "${to}" (${where}, for "${item}")`).join('; ')}.`);
+  }
+  if (removed.length > 0) {
+    ui.note(`✂️   Removed from the CV, because the fact check found ${removed.length === 1 ? 'it' : 'them'} in neither cv.md nor `
+      + `article-digest.md: ${removed.map(({ where, text, item }) => `${text} (${where}${item ? `, for "${item}"` : ''})`).join(', ')}.`);
+    ui.note('    That is what the posting asks for and your CV does not show. If you have this experience, add it to cv.md '
+      + 'and tailor again.');
+    ui.note('    The check looks for the exact words. If cv.md has one of these in another spelling, such as a singular, '
+      + 'write it into the CV in that spelling.');
+  }
+}
+
+/**
+ * Tailor the CV to one evaluated posting and save it as HTML, or in LaTeX
+ * (tailorLatexCv()): `deps.format`, else cv.output_format in the profile
+ * (readCvFormat()).
  *
  * The order is evaluateJob()'s: everything that can fail without a request
  * comes first. That is the report, the job description, the CV and the
@@ -3261,6 +3744,12 @@ function writeKeepingPrevious(path, content) {
  * @param {boolean} [deps.save] False returns the HTML and writes nothing. Default true.
  * @param {Awaited<ReturnType<typeof prepareSession>>} [deps.session] A session to stay on.
  * @param {TokenAccumulator} [deps.tracker]
+ * @param {'html'|'latex'} [deps.format] The format of the CV. Default cv.output_format in the profile, else html.
+ * @param {string} [deps.template] The template of a LaTeX CV. Default cv.latex_template in the profile, else default.
+ * @param {Date} [deps.today] The day a LaTeX CV is dated ({{DATE}}). Default today.
+ * @param {boolean|((engine: string) => Promise<object|null>)} [deps.compileCheck] For a LaTeX CV that is to be
+ *   compiled: ask the template's engine for its version before anything is sent (latexEngineProblem(), or this
+ *   function in its place), and stop with NO_ENGINE when it does not answer.
  * @returns {Promise<{success: boolean, htmlPath?: string, relPath?: string, reason?: string, code?: string,
  *   saved?: boolean, html?: string, report?: string, reportNum?: string, model?: string, usage?: object,
  *   attempts?: number, elapsedMs?: number, session?: Awaited<ReturnType<typeof prepareSession>>,
@@ -3272,7 +3761,7 @@ function writeKeepingPrevious(path, content) {
  *   brackets (pruneRejectedEntries()), `unlinked` the web addresses of links this run took
  *   off because none of the candidate's files holds them (withoutUnsupportedLinks()), `factCheck` what the check
  *   says about the CV as returned, `backup` the copy of an earlier CV this run replaced. Code FACT_CHECK is the
- *   one failure that comes with a saved file.
+ *   one failure that comes with a saved file. A LaTeX CV returns what tailorLatexCv() does.
  */
 export async function tailorCv(ref, deps = {}) {
   const { cfg, client } = deps;
@@ -3301,39 +3790,20 @@ export async function tailorCv(ref, deps = {}) {
   // -- 2. The candidate's files, the template, the checks. ------------------
   const candidate = loadCandidate(workspace);
   if (!candidate.ok) return failed(candidate.reason, 'SETUP');
+  // The caller's format, else the profile's. A CV in LaTeX goes its own way
+  // from here, and what it shares with this one is a function of its own.
+  const byProfile = readCvFormat({}, candidate.profileYml);
+  if ((deps.format ?? byProfile.format) === 'latex') {
+    return tailorLatexCv({ cfg, client, ui, workspace, deps, save, report, jdText, candidate, byProfile });
+  }
   const modes = readSystemFiles('modes', ['_shared.md', '_writing.md', 'pdf.md']);
   if (!modes.ok) return failed(modes.reason, 'SETUP');
   const templates = readSystemFiles('templates', ['cv-template.html']);
   if (!templates.ok) return failed(templates.reason, 'SETUP');
 
-  let checks;
-  try {
-    checks = await loadCvChecks();
-  } catch (err) {
-    return failed(`Could not load the CV checks of generate-pdf.mjs: ${err.message}`, 'SETUP');
-  }
-  let lockedKeys;
-  try {
-    lockedKeys = checks.readLockedSections(workspace.profileYml, checks.sectionKey);
-  } catch (err) {
-    return failed(`Could not read the locked sections of the CV: ${err.message}`, 'SETUP');
-  }
-  const missing = missingLockedSection(checks, candidate.cv, lockedKeys);
-  if (missing) return failed(missing, 'SETUP', { hints: ['Fix cv.locked_sections in config/profile.yml. Nothing was sent.'] });
-
-  // The fact check, run once on nothing: a config/cv-facts.json it cannot
-  // use is found now and not after two minutes of generation.
-  let factTools;
-  try {
-    const gate = await loadFactGate();
-    factTools = {
-      gate, checks, inputs: factGateInputs(workspace),
-      ownWords: `${candidate.cv}\n${gate.candidateOwnWords(workspace.dataRoot)}`,
-    };
-    checkCvFacts('', factTools);
-  } catch (err) {
-    return failed(`The fact check cannot run: ${err.message}`, 'SETUP', { hints: ['Nothing was sent.'] });
-  }
+  const tools = await loadCvCheckTools(workspace, candidate);
+  if (!tools.ok) return failed(tools.reason, tools.code, { hints: tools.hints });
+  const { checks, lockedKeys, factTools, ownText } = tools;
 
   // -- 3. The prompt, and whether it fits. ----------------------------------
   const files = {
@@ -3372,11 +3842,8 @@ export async function tailorCv(ref, deps = {}) {
   // The model saw placeholders when the profile asks for redaction: the real
   // name and contact details go back in, so the CV never ships with
   // "Candidate Name". The locked sections are compared after that, and the
-  // facts last, on the document as it would be saved.
-  // What a link in the CV may point to: an address one of the candidate's
-  // own files holds. Read from the files as they are, not as the model saw them.
-  const digestPath = join(workspace.dataRoot, 'article-digest.md');
-  const ownText = [candidate.cv, candidate.profileYml, existsSync(digestPath) ? readFileSync(digestPath, 'utf-8') : ''].join('\n');
+  // facts last, on the document as it would be saved. A link may point only
+  // where one of the candidate's own files does (ownText).
   const toCv = (content) => {
     const restored = restoreIfEnabled(extractHtmlDocument(content), candidate.profileYml);
     try {
@@ -3438,26 +3905,7 @@ export async function tailorCv(ref, deps = {}) {
   // Under the checks, not over them: the policy is this file's, and a reply
   // that brought its own <meta http-equiv> was refused above.
   const html = withContentPolicy(draft.html, expect.photo);
-  if (unlinked.length > 0) {
-    const one = unlinked.length === 1;
-    ui.note(`🔗  ${unlinked.length} link${one ? '' : 's'} taken off the CV, because ${one ? 'its address is' : 'their addresses are'} in `
-      + `none of your files (cv.md, config/profile.yml, article-digest.md): ${unlinked.join(', ')}.`);
-    ui.note(`    The text ${one ? 'it was' : 'they were'} on stays. If the address is right, add it to cv.md and tailor again.`);
-  }
-  if (rewritten.length > 0) {
-    // Nothing was lost here, and nothing is missing from the candidate's
-    // files: the check read a list in brackets item by item.
-    ui.note(`✏️   Written without brackets, because the fact check reads a list in brackets item by item and rejected a piece of `
-      + `it: ${rewritten.map(({ where, from, to, item }) => `"${from}" is now "${to}" (${where}, for "${item}")`).join('; ')}.`);
-  }
-  if (removed.length > 0) {
-    ui.note(`✂️   Removed from the CV, because the fact check found ${removed.length === 1 ? 'it' : 'them'} in neither cv.md nor `
-      + `article-digest.md: ${removed.map(({ where, text, item }) => `${text} (${where}${item ? `, for "${item}"` : ''})`).join(', ')}.`);
-    ui.note('    That is what the posting asks for and your CV does not show. If you have this experience, add it to cv.md '
-      + 'and tailor again.');
-    ui.note('    The check looks for the exact words. If cv.md has one of these in another spelling, such as a singular, '
-      + 'write it into the CV in that spelling.');
-  }
+  noteCvRepairs(ui, draft);
   if (check.verdict === 'warn') {
     ui.note(`⚠️   The fact check passes this CV with ${check.warnings} warning${check.warnings === 1 ? '' : 's'}: `
       + 'generate-pdf.mjs lists them when it renders the PDF.');
@@ -3521,9 +3969,11 @@ export async function tailorCv(ref, deps = {}) {
             // The command is named: this function also runs inside `run` and
             // `pipeline`, where "the command again" evaluates the posting a
             // second time or finds no pending row. With a fixed seed the same
-            // request gives the same CV, so that is said in its place.
+            // request gives the same CV, so that is said in its place. Under
+            // a profile that chooses LaTeX, `tailor` alone makes a LaTeX CV,
+            // so the command asks for HTML.
             `Four ways on. Run \`node ollama-runner.mjs tailor ${sameReportRef(workspace, report)}`
-              + `${deps.jdFile ? ` --jd ${shellWord(deps.jdFile)}` : ''}\` again`
+              + `${byProfile.format === 'latex' ? ' --html' : ''}${deps.jdFile ? ` --jd ${shellWord(deps.jdFile)}` : ''}\` again`
               + `${cfg.seed === undefined
                 ? ': every run writes a different CV, and most pass'
                 : ' with another OLLAMA_SEED or none: with the same seed the model writes the same CV'}. Or `
@@ -3532,6 +3982,380 @@ export async function tailorCv(ref, deps = {}) {
               + 'config/cv-facts.json.',
           ],
         },
+      ),
+    };
+  }
+  if (result.saved) ui.out(`\n✅  Tailored CV saved: ${result.relPath}`);
+  return result;
+}
+
+/**
+ * The final text check of generate-latex.mjs (runLatexFactGate()) on the
+ * .tex of a CV, said the same way wherever a .tex is checked: that it did not
+ * run, for a data root with no cv.md, and what it warns about beyond what the
+ * fact check of the projection listed (`listed`, asked for when it is needed).
+ *
+ * `added` counts those warnings as checkCvFacts() counts its own: the check's
+ * own warning (a long dash in the prose, which no check of the projection
+ * reads) as one, and each it gives that the fact check did not. A warning
+ * both give, a warn phrase of config/cv-facts.json in the text, counts once.
+ *
+ * @param {string} tex
+ * @param {{ui: ReturnType<typeof createUi>, workspace: ReturnType<typeof openWorkspace>,
+ *   factTools: Parameters<typeof checkCvFacts>[1], label: string, listed: () => object}} options
+ * @returns {Promise<Awaited<ReturnType<typeof runLatexFactGate>> & {added: number}>}
+ * @throws {Error} When the check cannot run.
+ */
+async function finalTextCheck(tex, { ui, workspace, factTools, label, listed }) {
+  const check = await runLatexFactGate(tex, { root: workspace.dataRoot, label });
+  let added = 0;
+  if (check.verdict === 'skipped') ui.note('⚠️   The final text check did not run: cv.md was not found.');
+  if (check.verdict === 'warn') {
+    if (check.reason) ui.note(`⚠️   ${String(check.reason).replace(/\s+/g, ' ').trim()}`);
+    const more = check.result ? factTools.gate.newFactWarnings(listed(), check.result) : null;
+    if (more) {
+      ui.note('⚠️   The final text check of the .tex warns about more:');
+      factTools.gate.printFactWarnings(more, (line) => ui.note(`  ${line}`));
+    }
+    added = (check.reason ? 1 : 0) + (more ? more.warnings.length + more.advisoryFacts.length + (more.coverage ? 1 : 0) : 0);
+  }
+  return { ...check, added };
+}
+
+/**
+ * The hint for a CV the final text check blocks on a value with a backslash
+ * in it: most likely a character escapeLatex() wrote as a command. The values
+ * alone, read again in the check's own terms (the same verifyFacts() on the
+ * same .tex and files): its reason also quotes the lines of cv.md it compared
+ * them with, and a backslash in one of those says nothing of the .tex.
+ *
+ * `saved` false is a run under --no-save, which wrote no .json to reword: the
+ * hint after this one says how to keep it.
+ *
+ * @returns {string[]} The hint, or none.
+ */
+function misreadEscapeHint(tex, factTools, { saved = true } = {}) {
+  let rejected = [];
+  try {
+    const facts = factTools.gate.verifyFacts(tex, factTools.inputs);
+    rejected = [...(facts.invented ?? []), ...(facts.unsupportedFacts ?? []).map(({ value }) => value)];
+  } catch { /* no hint, then: the block is reported all the same */ }
+  if (!rejected.some((value) => String(value).includes('\\'))) return [];
+  return [saved ? 'The check misread an escaped character: reword that line in the .json.' : 'The check misread an escaped character: reword that line.'];
+}
+
+/**
+ * Tailor the CV to one evaluated posting in LaTeX: the branch of tailorCv()
+ * for that format, from where the report, its posting and the candidate's
+ * files are read.
+ *
+ * The model is asked for the text of the CV as one JSON object, never for a
+ * line of LaTeX (lib/ollama-cv-latex.mjs says why), and the .tex is written
+ * from that text into a template the owner can change.
+ *
+ * First, everything that can fail without a request: the checks
+ * (loadCvCheckTools()), a locked section the payload has no section for, a
+ * header with no name (the header is the profile's, never the model's), the
+ * template, found, checked and written once with no text so that one it
+ * cannot use stops the run now, the page budget, and with
+ * `deps.compileCheck` the template's engine.
+ *
+ * A reply is held to what an HTML CV is held to, by the same functions
+ * (checkCvPayload()): a payload with its required fields, the locked
+ * sections, the order of the roles, the link rule and the fact check, with
+ * the same repair and the same one more request. Then the .tex is written,
+ * and the final text check of generate-latex.mjs reads it. A CV either check
+ * blocks is saved as its .json alone, for the owner to work on, and reported
+ * as FACT_CHECK: with no .tex of it, nothing can compile it, and a .tex of an
+ * earlier run is left as it is. Otherwise the .json and then the .tex are
+ * saved, each keeping the file it replaces as .bak.
+ *
+ * @param {object} context What tailorCv() has read: `cfg`, `client`, `ui`, `workspace`, `deps` and `save` as it
+ *   has them, the `report` and its `jdText`, the `candidate`'s files, and `byProfile`, the format and the template
+ *   the profile chooses (readCvFormat()).
+ * @returns {Promise<object>} tailorCv()'s result with `format: 'latex'`, and `tex` (the document), `payload` (the
+ *   payload saved) and `template` (its name) in place of `html`. When saved: `payloadPath` and `payloadRel`, the
+ *   .json; `texPath`, the .tex, except for a blocked CV; `relPath`, the .tex, or the .json of a blocked CV; `backup`
+ *   and `payloadBackup`, the earlier .tex and .json kept as .bak. Failures carry `format: 'latex'` too.
+ */
+async function tailorLatexCv({ cfg, client, ui, workspace, deps, save, report, jdText, candidate, byProfile }) {
+  const failed = (reason, code, more = {}) => failWith(ui, reason, code, { format: 'latex', ...more });
+  const nothingSent = 'Nothing was sent.';
+
+  // -- 2. The files, the checks, the header, the template. No request yet. --
+  const modes = readSystemFiles('modes', ['_shared.md', '_writing.md']);
+  if (!modes.ok) return failed(modes.reason, 'SETUP');
+  const tools = await loadCvCheckTools(workspace, candidate);
+  if (!tools.ok) return failed(tools.reason, tools.code, { hints: tools.hints });
+  const { checks, factTools } = tools;
+  const unplaced = tools.lockedKeys.find((key) => !LATEX_SECTION_KEYS.includes(key));
+  if (unplaced !== undefined) return failed(unplacedLockedSection(unplaced), 'SETUP', { hints: [nothingSent] });
+  const header = readCvHeader(candidate.profileYml);
+  if (!header.name) {
+    return failed('config/profile.yml has no candidate.full_name: the CV header needs it.', 'SETUP', {
+      hints: [`Add it under candidate: in config/profile.yml. ${nothingSent}`],
+    });
+  }
+  const template = resolveLatexTemplate(deps.template ?? byProfile.template, { dataRoot: workspace.dataRoot });
+  if (!template.ok) return failed(template.reason, 'SETUP', { hints: [nothingSent] });
+  const paper = resolvePageFormat(undefined, { profilePath: workspace.profileYml });
+  const today = deps.today ?? new Date();
+  const render = (payload) => renderCvTex({ template: template.text, templateName: template.name, payload, header, paper, date: today }).tex;
+  try {
+    render({});
+  } catch (err) {
+    return failed(`The CV cannot be written in the template "${template.name}": ${String(err?.message ?? err)}`, 'SETUP', {
+      hints: [nothingSent],
+    });
+  }
+  const limit = await readCvPageLimit(workspace);
+  if (!limit.ok) return failed(`${limit.reason} Fix cv.max_pages or cv.strict_pages in config/profile.yml. ${nothingSent}`, 'SETUP');
+  const { maxPages } = limit;
+  if (deps.compileCheck) {
+    // Asked now: a CV tailored for minutes and then not compiled for want of an engine is time lost.
+    const { engine } = template.options;
+    const engineProblem = typeof deps.compileCheck === 'function' ? deps.compileCheck : latexEngineProblem;
+    const problem = await engineProblem(engine);
+    if (problem) {
+      // Installing is the remedy only for an engine that did not answer at
+      // all. One that ran out of time is there, and one the check could not
+      // start (TIMEOUT, COMPILE) is not mended by installing it again.
+      let remedy = `Run \`${engine} --version\` in a terminal to see why it does not start`;
+      if (problem.code === 'NO_ENGINE') remedy = `Install ${engine}`;
+      else if (problem.code === 'TIMEOUT') remedy = `Run \`${engine} --version\` in a terminal to see what keeps it from answering`;
+      return failed(problem.reason, problem.code === 'NO_ENGINE' ? 'NO_ENGINE' : 'LATEX', {
+        hints: [`${remedy}, or tailor without --pdf and compile the CV later. ${nothingSent}`],
+      });
+    }
+  }
+
+  // -- 3. The prompt, and whether it fits. ----------------------------------
+  const files = { shared: modes.files['_shared.md'], writing: modes.files['_writing.md'] };
+  // The share of cv.md's text a CV has to carry, as an HTML CV: cvExpectations()
+  // takes it from cv.md alone, and the template it is given is for HTML checks.
+  const { minTextChars } = cvExpectations('', candidate);
+  const validate = (text) => latexReplyProblem(text, minTextChars);
+  const { system, user } = buildLatexTailorPrompt(files, candidate, report.text, jdText, { maxPages });
+  const promptTokens = estimateTokens(system) + estimateTokens(user);
+
+  let session;
+  let reply;
+  try {
+    session = await prepareSession({ cfg, client, promptTokens, previous: deps.session });
+    ui.note(`📄  Tailoring the CV for ${report.rel}, in LaTeX (template ${template.name})`);
+    ui.note(describeSession(session, promptTokens));
+    ui.note(`🤖  Asking ${session.model}. Reading the prompt comes first, so the first words can take a while.`);
+
+    // -- 4. The model. ------------------------------------------------------
+    reply = await askModel({ cfg, client, session, system, user, promptTokens, validate, ui: withoutStreaming(ui) });
+  } catch (err) {
+    const { reason, code, hints } = describeFailure(err, cfg);
+    const failure = failed(reason, code, { hints: [...hints, 'Nothing was saved.'], session });
+    showRejectedReply(withoutStreaming(ui), err);
+    return failure;
+  }
+  deps.tracker?.record('pdf payload', reply.usage);
+  ui.note(`✔   Reply complete in ${Math.round(reply.elapsedMs / 1000)}s`
+    + `${reply.usage.completion_tokens ? ` (${kTokens(reply.usage.completion_tokens)} tokens)` : ''}.`);
+
+  // -- 5. From reply to CV. -------------------------------------------------
+  // The real name and contact details go back into every string when the
+  // profile asks for redaction. A placeholder address that stood with its
+  // scheme comes back without one (restoreIfEnabled() takes the scheme with
+  // the placeholder): it gets https:// again, so that the link rule judges it
+  // and the saved .json still reads as a payload. The checks read the dates
+  // as the template prints them.
+  const shownDates = shownDatesFor(template.options);
+  const toCv = (content) => {
+    const restored = mapPayloadStrings(parseCvPayload(content), (text) => restoreIfEnabled(text, candidate.profileYml));
+    const items = restored.projects.items.map((item) => (
+      item.url && !/^https?:\/\//i.test(item.url) ? { ...item, url: `https://${item.url}` } : item));
+    return checkCvPayload({ ...restored, projects: { ...restored.projects, items } }, tools, { repair: true, shownDates });
+  };
+  let draft;
+  try {
+    draft = toCv(reply.content);
+  } catch (err) {
+    if (err?.lockedSection) {
+      return failed(err.message, 'LOCKED_SECTIONS', {
+        hints: ['Nothing was saved. The section is locked under cv.locked_sections in config/profile.yml.'],
+        session,
+      });
+    }
+    return failed(`The fact check could not run on the reply: ${String(err?.message ?? err)}`, 'SETUP', {
+      hints: ['Nothing was saved.'], session,
+    });
+  }
+  let usage = reply.usage;
+  let attempts = reply.attempts;
+  let elapsedMs = reply.elapsedMs;
+
+  /** True when the order check is among what blocks a draft: then it is not the fact check alone that does. */
+  const outOfOrder = ({ check }) => check.findings.some(({ key }) => key === 'experience-order');
+  if (draft.check.verdict === 'block' && cfg.retries >= 1) {
+    // One more request, told what the checks still reject, as for an HTML CV.
+    ui.note(`⚠️   ${outOfOrder(draft) ? 'The checks block' : 'The fact check blocks'} this CV (${draft.check.findings.length} `
+      + `finding${draft.check.findings.length === 1 ? '' : 's'} left after removing what could be removed). Asking once more, with the `
+      + 'findings…');
+    try {
+      const again = buildLatexTailorPrompt(files, candidate, report.text, jdText, { maxPages }, payloadCheckFeedback(draft.check.findings));
+      const againTokens = estimateTokens(again.system) + estimateTokens(again.user);
+      session = await prepareSession({ cfg, client, promptTokens: againTokens, previous: session });
+      const second = await askModel({
+        cfg, client, session, system: again.system, user: again.user, promptTokens: againTokens, validate, ui: withoutStreaming(ui),
+      });
+      deps.tracker?.record('pdf payload', second.usage);
+      attempts += second.attempts;
+      elapsedMs += second.elapsedMs;
+      usage = second.usage;
+      const redraft = toCv(second.content);
+      if (redraft.check.findings.length < draft.check.findings.length) draft = redraft;
+    } catch (err) {
+      ui.note(`    The second request gave nothing usable (${String(err?.message ?? err).split('\n')[0]}). Keeping the first CV.`);
+    }
+  }
+
+  const { check } = draft;
+  noteCvRepairs(ui, draft);
+  // Listed here: no generate-pdf.mjs reads this CV to list them later, as it
+  // reads an HTML one. Printed the way it prints them.
+  const factsOf = () => factTools.gate.verifyFacts(checks.normalizeTextForATS(draft.html).html, factTools.inputs);
+  const printWarnings = (facts) => factTools.gate.printFactWarnings(facts, (line) => ui.note(`  ${line}`));
+  let listed = null;
+  if (check.verdict === 'warn') {
+    ui.note(`⚠️   The fact check passes this CV with ${check.warnings} warning${check.warnings === 1 ? '' : 's'}:`);
+    listed = factsOf();
+    printWarnings(listed);
+  }
+
+  // -- 6. The .tex, and the final text check. -------------------------------
+  let tex;
+  try {
+    tex = render(draft.payload);
+  } catch (err) {
+    return failed(`The CV could not be written in the template "${template.name}": ${String(err?.message ?? err)}`, 'SETUP', {
+      hints: ['Nothing was saved.'], session,
+    });
+  }
+  const stem = `cv-${candidateSlug(candidate.profileYml)}-${report.stem}`;
+  // Only on a CV the checks above pass: it reads the .tex as text, and sees
+  // no employer, date, degree or skill in the macros the text is written in.
+  let finalCheck = null;
+  // The warnings the final text check adds to the fact check's (finalTextCheck()).
+  let finalWarnings = 0;
+  if (check.verdict !== 'block') {
+    try {
+      finalCheck = await finalTextCheck(tex, { ui, workspace, factTools, label: `${stem}.tex`, listed: () => listed ?? factsOf() });
+    } catch (err) {
+      return failed(`The final text check could not run: ${String(err?.message ?? err)}`, 'SETUP', { hints: ['Nothing was saved.'], session });
+    }
+    finalWarnings = finalCheck.added;
+  }
+  const textBlock = finalCheck?.verdict === 'block' ? String(finalCheck.reason).replace(/\s+/g, ' ').trim() : null;
+  const blocked = check.verdict === 'block' || textBlock !== null;
+
+  const result = {
+    success: true,
+    saved: false,
+    format: 'latex',
+    tex,
+    payload: draft.payload,
+    template: template.name,
+    report: report.rel,
+    reportNum: report.num,
+    model: session.model,
+    usage,
+    attempts,
+    elapsedMs,
+    session,
+    removed: draft.removed,
+    rewritten: draft.rewritten,
+    unlinked: draft.unlinked,
+    // What both checks say: a CV that only the final text check warns about
+    // passes with warnings, and the --json receipt says so.
+    factCheck: textBlock === null
+      ? {
+        verdict: check.verdict === 'pass' && finalCheck?.verdict === 'warn' ? 'warn' : check.verdict,
+        findings: check.findings.map(({ text }) => text),
+        warnings: check.warnings + finalWarnings,
+      }
+      : { verdict: 'block', findings: [textBlock], warnings: check.warnings },
+  };
+
+  // -- 7. Save. -------------------------------------------------------------
+  // Named after the report, as the HTML CV is. The .json first: it is the CV
+  // the checks read and the .tex is made from. A blocked CV is kept as its
+  // .json alone, so no .tex of it exists for `pdf` to compile.
+  const payloadPath = join(workspace.output, `${stem}.json`);
+  const texPath = join(workspace.output, `${stem}.tex`);
+  if (save) {
+    try {
+      mkdirSync(workspace.output, { recursive: true });
+      const payloadBackup = writeKeepingPrevious(payloadPath, `${JSON.stringify({ template: template.name, ...draft.payload }, null, 2)}\n`);
+      const backup = blocked ? null : writeKeepingPrevious(texPath, tex);
+      if (backup) result.backup = displayPath(backup, workspace.dataRoot);
+      if (payloadBackup) result.payloadBackup = displayPath(payloadBackup, workspace.dataRoot);
+      const kept = [result.backup, result.payloadBackup].filter(Boolean);
+      if (kept.length > 0) ui.note(`    An earlier CV for this report was replaced. It is kept as ${kept.join(' and ')}.`);
+    } catch (err) {
+      return { ...result, ...failed(`Could not save the tailored CV: ${err.message}`, 'SAVE') };
+    }
+    result.saved = true;
+    result.payloadPath = payloadPath;
+    result.payloadRel = displayPath(payloadPath, workspace.dataRoot);
+    if (!blocked) result.texPath = texPath;
+    result.relPath = blocked ? result.payloadRel : displayPath(texPath, workspace.dataRoot);
+  }
+
+  if (blocked) {
+    // Kept, because the owner can finish it by hand, and a failure all the
+    // same: nothing may compile or report this CV as done.
+    const kept = result.saved ? result.payloadRel : null;
+    // The command that tailors this report in LaTeX again: the options this
+    // run took for its format and its template that the profile does not give.
+    const asRun = `${byProfile.format === 'latex' ? '' : ' --latex'}${byProfile.template === template.name ? '' : ` --template ${template.name}`}`;
+    const tailorAgain = `Run \`node ollama-runner.mjs tailor ${sameReportRef(workspace, report)}${asRun}`
+      + `${deps.jdFile ? ` --jd ${shellWord(deps.jdFile)}` : ''}\` again`
+      + `${cfg.seed === undefined
+        ? ': every run writes a different CV, and most pass'
+        : ' with another OLLAMA_SEED or none: with the same seed the model writes the same CV'}.`;
+    const moreEvidence = 'add the evidence to cv.md or article-digest.md and tailor again; or, for a claim you have verified, add an '
+      + 'exception to config/cv-facts.json.';
+    // Under --no-save no .json was written, and only the .tex is printed,
+    // which `pdf` does not compile without its .json beside it: the way that
+    // edits the .json is no way on, and running without --no-save is.
+    const hints = kept
+      ? [
+        `The CV is kept for you to work on: ${kept}. No .tex was written, and no PDF.`,
+        `Four ways on. ${tailorAgain} Or edit ${kept} and run \`node ollama-runner.mjs pdf ${shellWord(kept)}\`; ${moreEvidence}`,
+      ]
+      : [
+        'Nothing was saved (--no-save).',
+        `Three ways on. ${tailorAgain} Or ${moreEvidence} Run without --no-save to keep a blocked CV as its .json, for you to edit.`,
+      ];
+    if (textBlock !== null) {
+      return {
+        ...result,
+        ...failed(`The final text check blocks this CV: ${textBlock}`, 'FACT_CHECK', {
+          hints: [...misreadEscapeHint(tex, factTools, { saved: Boolean(kept) }), ...hints],
+        }),
+      };
+    }
+    // The order of the roles is no claim cv.md lacks, and adding evidence to it
+    // changes nothing: said apart, in the order check's own terms, since the
+    // order it asks for is newest first by start date, which cv.md need not keep.
+    const unordered = outOfOrder(draft);
+    const what = [
+      ...(check.findings.length > (unordered ? 1 : 0) ? ['it states what cv.md and article-digest.md do not'] : []),
+      ...(unordered ? ['its roles are not newest-first by start date'] : []),
+    ].join(', and ');
+    return {
+      ...result,
+      ...failed(
+        `${unordered ? 'The checks block' : 'The fact check blocks'} this CV: ${what} (${check.findings.length} `
+          + `finding${check.findings.length === 1 ? '' : 's'}).`,
+        'FACT_CHECK',
+        { hints: [...check.findings.map(({ text }) => `- ${text}`), ...hints] },
       ),
     };
   }
@@ -3567,8 +4391,24 @@ function sameReportRef(workspace, report) {
   return shellWord([report.rel, `./${report.rel}`].find(leadsBack) ?? report.path);
 }
 
-/** What a tailoring run leaves in a --json receipt. The HTML is included only when nothing was saved. */
+/**
+ * What a tailoring run leaves in a --json receipt. The HTML is included only when nothing was saved.
+ *
+ * A LaTeX CV names its files, `tex` and `payload`, as the data root names
+ * them; its .tex is the `text` when nothing was saved. The payload itself,
+ * the session and the absolute paths stay out.
+ */
 function tailorReceipt(result) {
+  if (result.format === 'latex') {
+    const { tex, payload, texPath, payloadPath, relPath, payloadRel, saved, session, ...latex } = result;
+    return {
+      ...latex,
+      saved: Boolean(saved),
+      ...(texPath ? { tex: relPath } : {}),
+      ...(payloadRel ? { payload: payloadRel } : {}),
+      ...(!saved && tex ? { text: tex } : {}),
+    };
+  }
   const { html, htmlPath, relPath, saved, session, ...rest } = result;
   return {
     ...rest,
@@ -3582,8 +4422,15 @@ async function cmdTailor(ctx) {
   const { flags, ui, tracker } = ctx;
   const ref = soleArgument(ctx);
   if (ref === null) return 1;
+  // The format first, before the server is asked anything, so that the
+  // refusal below names the file the PDF would be made from.
+  const profile = profileText(ctx.workspace());
+  const choice = readCvFormat(flags, profile);
+  const latex = choice.format === 'latex';
   if (flags.pdf && flags.noSave) {
-    return refuse(ctx, '--pdf cannot be used with --no-save: the PDF is rendered from the saved HTML.');
+    return refuse(ctx, latex
+      ? '--pdf cannot be used with --no-save: the PDF is compiled from the saved .tex.'
+      : '--pdf cannot be used with --no-save: the PDF is rendered from the saved HTML.');
   }
 
   const { cfg, client } = ctx.ollama();
@@ -3591,26 +4438,41 @@ async function cmdTailor(ctx) {
   tracker.recordZeroToken('evaluation');
   const result = await tailorCv(ref, {
     cfg, client, ui, workspace: ctx.workspace(), tracker, jdFile: flags.jd, save: !flags.noSave,
+    // With --pdf a LaTeX CV is compiled, and its engine is asked first, before the model.
+    format: choice.format, template: choice.template, compileCheck: latex && flags.pdf ? ctx.latexEngineProblem : false,
   });
   // Only for a CV the checks passed: one the fact check blocks is a failure, and generate-pdf.mjs would refuse it.
-  const pdf = result.success && flags.pdf
-    ? renderCvPdf({ htmlPath: result.htmlPath, reportNum: result.reportNum }, ctx)
-    : null;
+  // A LaTeX CV is compiled from the .tex just saved, which its .json is checked with once more (compileCvPdf()).
+  let pdf = null;
+  if (result.success && flags.pdf) {
+    pdf = latex
+      ? await compileCvPdf({ texPath: result.texPath, payloadPath: result.payloadPath, reportNum: result.reportNum }, ctx)
+      : renderCvPdf({ htmlPath: result.htmlPath, reportNum: result.reportNum }, ctx);
+  }
 
   ui.receipt({
     command: 'tailor',
     ...tailorReceipt(result),
-    ...(pdf?.success ? { pdf: pdf.path, factWarnings: pdf.factWarnings } : {}),
+    ...(pdf?.success ? { pdf: pdf.path, ...(pdf.pages === undefined ? {} : { pages: pdf.pages }), factWarnings: pdf.factWarnings } : {}),
     ...(pdf && !pdf.success ? { success: false, reason: pdf.reason, code: pdf.code } : {}),
   });
-  if (result.html === undefined) return 1;
+  // Nothing produced: neither an HTML CV nor a .tex.
+  const made = result.html ?? result.tex;
+  if (made === undefined) return 1;
 
   // Not streamed and in no file, whether that was asked for or the save
   // failed: this is the only place the user will see it.
-  if (!result.saved) ui.out(result.html.trimEnd());
+  if (!result.saved) ui.out(made.trimEnd());
   else if (!result.success) { /* the failure has said where the file is and what to do with it */ }
-  else if (!flags.pdf) ui.note(`    Next, the PDF: node ollama-runner.mjs pdf ${shellWord(ref)}`);
-  else if (pdf.success) ui.note(PDF_TRACKER_HINT);
+  // `pdf <report>` takes the report's CV in the profile's format, so a CV in
+  // another format is named by its file: a LaTeX CV under any profile, and
+  // an HTML one under a profile that chooses LaTeX.
+  else if (!flags.pdf) {
+    const byFile = latex || readCvFormat({}, profile).format === 'latex';
+    ui.note(`    Next, the PDF: node ollama-runner.mjs pdf ${shellWord(byFile ? result.relPath : ref)}`);
+  }
+  // A compiled PDF ticks the tracker only when its row names a report.
+  else if (pdf.success && (!latex || pdf.indexed)) ui.note(PDF_TRACKER_HINT);
   ui.out(`\n${formatBreakdown(tracker, result.model, 'ollama')}`);
   return result.success && (!pdf || pdf.success) ? 0 : 1;
 }
@@ -3638,9 +4500,11 @@ function fileIdentity(path) {
  *
  * @param {ReturnType<typeof openWorkspace>} workspace
  * @param {string} ref
+ * @param {'html'|'latex'} [profileFormat] The format the profile chooses (profileCvFormat()). Under LaTeX, the
+ *   `tailor` command named for a report with no HTML CV asks for HTML: alone, it would make a LaTeX CV.
  * @returns {{ok: true, htmlPath: string, reportNum?: string, report?: string} | {ok: false, reason: string}}
  */
-function findTailoredCv(workspace, ref) {
+function findTailoredCv(workspace, ref, profileFormat = 'html') {
   const wanted = String(ref ?? '').trim();
   if (/\.html?$/i.test(wanted)) {
     // From where the command was typed, then from the data root, which is
@@ -3661,7 +4525,8 @@ function findTailoredCv(workspace, ref) {
   if (written.length === 0) {
     return {
       ok: false,
-      reason: `No tailored CV for ${report.rel} in ${workspace.output}. Run first: node ollama-runner.mjs tailor ${shellWord(wanted)}`,
+      reason: `No tailored CV for ${report.rel} in ${workspace.output}. Run first: node ollama-runner.mjs tailor ${shellWord(wanted)}`
+        + `${profileFormat === 'latex' ? ' --html' : ''}`,
     };
   }
   return { ok: true, htmlPath: written[0].path, reportNum: report.num, report: report.rel };
@@ -3742,6 +4607,547 @@ function renderCvPdf({ htmlPath, reportNum, format }, ctx) {
   return { success: true, path, pdfPath, factWarnings };
 }
 
+// -- The PDF of a LaTeX CV ----------------------------------------------------
+//
+// No script of upstream's compiles the .tex of a payload, so this file does:
+// a TeX engine makes the PDF in a build folder of its own (compileLatex() of
+// lib/ollama-cv-latex.mjs), and what generate-pdf.mjs does around a render of
+// an HTML CV is done here around the compile: the checks of the CV, the page
+// limit with its .overflow draft, and the row of data/pdf-index.tsv.
+
+/**
+ * The header line of data/pdf-index.tsv, as generate-pdf.mjs writes it over
+ * the file each time it saves it. The same here, so that neither rewrites it.
+ */
+const PDF_INDEX_HEADER = '# report\tpdf\thtml\tformat\tdate\tkind - written by generate-pdf.mjs, do not edit\n';
+
+let pdfTools;
+/**
+ * What a compiled PDF is saved and recorded with: applyManifestRow() and
+ * inferReportNumber() from generate-pdf.mjs, the atomic write and the paths
+ * of tracker-utils.mjs, and the lock of pipeline-lock.mjs. Loaded when a PDF
+ * is, for loadCvChecks()'s reason: generate-pdf.mjs creates output/ as it
+ * loads.
+ */
+function loadPdfTools() {
+  pdfTools ??= (async () => {
+    const [{ applyManifestRow, inferReportNumber }, { resolvePdfIndexPath, resolveWorkspaceRootFor, writeFileAtomic }, { withPipelineLock }] = (
+      await Promise.all([import('./generate-pdf.mjs'), import('./tracker-utils.mjs'), import('./pipeline-lock.mjs')]));
+    return { applyManifestRow, inferReportNumber, resolvePdfIndexPath, resolveWorkspaceRootFor, writeFileAtomic, withPipelineLock };
+  })();
+  return pdfTools;
+}
+
+/** A .tex without its comments: each line to the first `%` that no backslash makes a character. */
+function texCode(tex) {
+  return String(tex ?? '').split(/\r?\n/).map((line) => {
+    for (let index = 0; index < line.length; index += 1) {
+      if (line[index] === '\\') index += 1;
+      else if (line[index] === '%') return line.slice(0, index);
+    }
+    return line;
+  }).join('\n');
+}
+
+/**
+ * The paper a .tex is set on, as data/pdf-index.tsv names it: a4 when its
+ * code says a4paper, else letter. Read from the .tex and not from the
+ * profile: a template pack can set its own, whatever the profile says.
+ */
+const paperOfTex = (tex) => (/a4paper/.test(texCode(tex)) ? 'a4' : 'letter');
+
+/**
+ * Write a PDF over the page limit beside the one it would have been, as
+ * generate-pdf.mjs writes its own (writeOverflowDraft() there, which it does
+ * not export): `<name>.overflow.pdf`, else `-2`, `-3` and on, the first name
+ * that is free, created with 'wx' so that a file already there is never
+ * replaced. The PDF itself is left as it was: it is the last CV that kept to
+ * the limit.
+ *
+ * @param {string} pdfPath
+ * @param {Buffer} bytes
+ * @returns {string} The draft written.
+ */
+function writeOverflowDraft(pdfPath, bytes) {
+  const base = pdfPath.replace(/\.pdf$/i, '');
+  for (let n = 1; ; n += 1) {
+    const draft = n === 1 ? `${base}.overflow.pdf` : `${base}.overflow-${n}.pdf`;
+    try {
+      writeFileSync(draft, bytes, { flag: 'wx' });
+      return draft;
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err;
+    }
+  }
+}
+
+/**
+ * Record a compiled PDF in data/pdf-index.tsv, where merge-tracker.mjs finds
+ * the PDF of a report and ticks its row of the tracker. A MIRROR of
+ * updatePDFManifest() in generate-pdf.mjs, which does not export it: the same
+ * file (resolvePdfIndexPath(), which CAREER_OPS_PDF_INDEX moves), the PDF's
+ * path from the same workspace root, the same lock, the same rules for the
+ * rows (applyManifestRow(): the CV of a report takes the place of the
+ * report's earlier one), the same atomic write and header line. The source
+ * column is left empty: its readers hand it to generate-pdf.mjs as an HTML CV
+ * to render again, which a .tex is not.
+ *
+ * Without a report number, the row is keyed by the number of the report
+ * whose CV the PDF is by its name: the name `tailor` gave it
+ * (cv-<candidate>-<report>), which is the name `tailor --latex` tells the
+ * owner to run `pdf` on (cvReportNumber()). That number has as many digits as
+ * the report's: inferReportNumber() reads three, and gave report 1000 and
+ * later no row the tracker could tick. Failing that, by three digits in the
+ * name, as generate-pdf.mjs reads one, and that is said once the row is
+ * written: such a name can hold three digits of something else, a company's
+ * in the name of a report that has no number of its own, and the next merge
+ * would then tick the row of a report this CV is not for, without a word.
+ *
+ * @param {{pdfPath: string, reportNum?: string, paper: 'a4'|'letter'}} row
+ * @param {ReturnType<typeof openWorkspace>} workspace
+ * @param {ReturnType<typeof createUi>} ui
+ * @returns {Promise<string>} The report number the row is keyed by: `reportNum`, else the number of the report the
+ *   PDF's name names, else the number in the PDF's name (inferReportNumber(), as generate-pdf.mjs reads one), else ''.
+ */
+async function indexCompiledPdf({ pdfPath, reportNum, paper }, workspace, ui) {
+  const tools = await loadPdfTools();
+  const given = /^\d+$/.test(String(reportNum ?? '')) ? reportNum : null;
+  const own = given === null ? cvReportNumber(workspace, basename(pdfPath)) : null;
+  const inferred = given === null && own === null ? tools.inferReportNumber(pdfPath) : null;
+  const key = given ?? own ?? inferred?.reportNum ?? '';
+  const manifestPath = tools.resolvePdfIndexPath(resolveTrackerPath(workspace.dataRoot));
+  const pdf = relative(tools.resolveWorkspaceRootFor(workspace.dataRoot), pdfPath).split(sep).join('/');
+  mkdirSync(dirname(manifestPath), { recursive: true });
+  await tools.withPipelineLock(manifestPath, () => {
+    const existing = existsSync(manifestPath) ? readFileSync(manifestPath, 'utf-8').split('\n') : [];
+    const lines = tools.applyManifestRow(existing, { reportNum: key, pdf, html: '', format: paper, date: localToday(), kind: 'cv' });
+    tools.writeFileAtomic(manifestPath, `${PDF_INDEX_HEADER}${lines.join('\n')}\n`);
+  });
+  if (inferred) {
+    ui.note(`⚠️   No report number given: the PDF's row in data/pdf-index.tsv takes report ${key} from the file name `
+      + `"${basename(inferred.from)}".`);
+  }
+  return key;
+}
+
+/**
+ * The number of the report whose CV `pdfName` is: a report in reports/ with a
+ * leading number whose file name, .pdf for .md, ends the PDF's name after a
+ * hyphen, as the name `tailor` gives that report's CV does
+ * (cv-<candidate>-<report>). The number as the report's name has it, of any
+ * length. Of two that fit, the longer name, the one more of the PDF's name
+ * matches. Null when none fits or reports/ cannot be listed.
+ *
+ * @param {ReturnType<typeof openWorkspace>} workspace
+ * @param {string} pdfName
+ * @returns {string|null}
+ */
+function cvReportNumber(workspace, pdfName) {
+  let reports;
+  try {
+    reports = readdirSync(workspace.reports);
+  } catch {
+    return null;
+  }
+  const name = pdfName.toLowerCase();
+  const fits = reports
+    .filter((report) => !RESERVATION_FILE_RE.test(report))
+    .map((report) => /^(\d+)-.+\.md$/i.exec(report))
+    .filter((match) => match && name.endsWith(`-${match[0].replace(/\.md$/i, '').toLowerCase()}.pdf`))
+    .sort((a, b) => b[0].length - a[0].length);
+  return fits[0]?.[1] ?? null;
+}
+
+/** Whether two paths name one file: resolved, and on Windows, whose file names ignore case, compared without it. */
+function samePlace(a, b) {
+  const [first, second] = [resolve(a), resolve(b)];
+  return process.platform === 'win32' ? first.toLowerCase() === second.toLowerCase() : first === second;
+}
+
+/** A file named on the command line: as given when the path is absolute, else from the working directory, then from the data root. */
+function namedFile(workspace, wanted) {
+  const places = isAbsolute(wanted) ? [wanted] : [resolve(wanted), resolve(workspace.dataRoot, wanted)];
+  return places.find((path) => statSync(path, { throwIfNoEntry: false })?.isFile()) ?? null;
+}
+
+/**
+ * The LaTeX CV `tailor --latex` wrote for a report: its .json, and its .tex
+ * unless the .json is newer, the .tex then being the file compiled (the one
+ * tailor wrote, a layout edited by hand, or the .tex of a compile that
+ * failed). A .tex as old as its .json counts as made from it: tailor writes
+ * the two one after the other, and a file system whose clock ticks coarsely
+ * gives both one time, so the .json was taken for the newer and the .tex
+ * written again. Only a .tex older than its .json, which an edit of the .json
+ * leaves, is written from the .json again. Of two .json files, which a change
+ * of the name in the profile leaves, the later one.
+ *
+ * @param {ReturnType<typeof openWorkspace>} workspace
+ * @param {string} ref
+ * @returns {{ok: true, payloadPath: string, texPath?: string, reportNum: string, report: string}
+ *   | {ok: false, reason: string}}
+ */
+function findTailoredLatexCv(workspace, ref) {
+  const wanted = String(ref ?? '').trim();
+  const report = findReport(workspace, wanted);
+  if (!report.ok) return report;
+  const timeOf = (path) => statSync(path, { throwIfNoEntry: false })?.mtimeMs ?? null;
+  const ending = `-${report.stem}.json`.toLowerCase();
+  const written = (existsSync(workspace.output) ? readdirSync(workspace.output) : [])
+    .filter((name) => /^cv-./i.test(name) && name.length > 3 + ending.length && name.toLowerCase().endsWith(ending))
+    .map((name) => ({ path: join(workspace.output, name), time: timeOf(join(workspace.output, name)) ?? 0 }))
+    .sort((a, b) => b.time - a.time);
+  if (written.length === 0) {
+    return {
+      ok: false,
+      reason: `No tailored LaTeX CV for ${report.rel} in ${workspace.output}. Run first: node ollama-runner.mjs tailor ${shellWord(wanted)} --latex`,
+    };
+  }
+  const [{ path: payloadPath, time }] = written;
+  const texPath = payloadPath.replace(/\.json$/i, '.tex');
+  const texTime = timeOf(texPath);
+  return { ok: true, payloadPath, ...(texTime !== null && texTime >= time ? { texPath } : {}), reportNum: report.num, report: report.rel };
+}
+
+/** A call of contentMacros() as a line of a message can show it: up to 160 characters. */
+const shownCall = (call) => (call === undefined ? '(none)' : call.length > 160 ? `${call.slice(0, 159)}…` : call);
+
+/**
+ * Compile a tailored CV in LaTeX to a PDF: the PDF of `tailor --latex --pdf`,
+ * the pdf step of `pipeline` and `run` for a CV in LaTeX, and `pdf` on such a
+ * CV, its .json or its .tex.
+ *
+ * The .json is the CV. Whatever the route, its payload is held to the checks
+ * a tailored CV is held to (checkCvPayload()), in the form that repairs
+ * nothing and writes nothing back: a locked section that changed, roles out
+ * of order, a link none of the candidate's files holds and every finding of
+ * the fact check stop it, so no route compiles a CV the checks block. Then:
+ *   - with `payloadPath` alone: the payload is written into its template
+ *     (`template`, else the template the .json names, else the profile's),
+ *     the final text check reads that .tex, and the .tex is saved to output/
+ *     under the .json's name, keeping the one it replaces as .bak;
+ *   - with `texPath`: the payload is the .json beside it, or `payloadPath`. It
+ *     is written into the template the .tex names on its line 1, to compare:
+ *     a .tex may change the layout of its CV and never its text, so the calls
+ *     of the macros that carry text (contentMacros()) have to be the same in
+ *     both. The final text check reads the .tex as it is, and it is compiled
+ *     as it is, with the engine its header names. The comparison reads what
+ *     the calls hold, not what the page prints, and that limit is caught
+ *     neither here nor by the final text check, which reads the source: a
+ *     .tex that redefines a macro passes, in its preamble or in its body
+ *     (through \csname, or a macro the calls print with, such as \cvStop),
+ *     and so do the other edits the comment of contentMacros() lists.
+ *
+ * The compile is compileLatex()'s, or the `compileLatex` seam of main(). The
+ * PDF reaches output/ only once its page count is within cv.max_pages: over
+ * it, the bytes go to an .overflow draft beside it, the PDF there is left as
+ * it was, and the run fails. A PDF delivered gets its row in
+ * data/pdf-index.tsv (indexCompiledPdf()), whose failure is only said.
+ *
+ * Every failure names the file kept and the command to run once it is
+ * mended: after the .tex is written, `pdf` of that .tex, or of the .json for
+ * a .json outside output/, whose .tex has no .json beside it. Nothing is
+ * thrown.
+ *
+ * @param {object} job
+ * @param {string} [job.texPath] A .tex to compile as it is.
+ * @param {string} [job.payloadPath] The payload. Without `texPath`, the CV to write into its template and compile.
+ * @param {string} [job.reportNum] The report's number, the key of the PDF's row in data/pdf-index.tsv.
+ * @param {string} [job.template] Without `texPath`: the template to write the payload in.
+ * @param {'a4'|'letter'} [job.paper] Without `texPath`: the paper. Default page_format in the profile.
+ * @param {CommandContext} ctx
+ * @returns {Promise<{success: true, path: string, pdfPath: string, pages: number, factWarnings: number,
+ *   indexed: string|null, tex: string, payload: string}
+ *   | {success: false, reason: string, code: string, tex?: string, payload?: string}>} `path` is the PDF as the data
+ *   root names it, `factWarnings` how many things the checks warned about, `indexed` the report number of its row in
+ *   data/pdf-index.tsv ('' for a row without one, null when the row could not be written), `tex` and `payload` the
+ *   files as the data root names them: the .tex compiled or written, and the .json.
+ */
+async function compileCvPdf({ texPath, payloadPath, reportNum, template, paper } = {}, ctx) {
+  const { ui } = ctx;
+  const workspace = ctx.workspace();
+  const shown = (path) => displayPath(path, workspace.dataRoot);
+  const pdfCommand = (path) => `node ollama-runner.mjs pdf ${shellWord(shown(path))}`;
+  const jsonPath = payloadPath ?? texPath.replace(/\.tex$/i, '.json');
+  // The .tex compiled: the one given, or the one written from the .json once its checks pass.
+  let texFile = texPath ?? null;
+  const files = () => ({
+    ...(texFile && existsSync(texFile) ? { tex: shown(texFile) } : {}),
+    ...(existsSync(jsonPath) ? { payload: shown(jsonPath) } : {}),
+  });
+  const fail = (reason, code, next, { hints = [] } = {}) => failWith(ui, reason, code, {
+    hints: [...hints, `The CV is kept: ${shown(texFile ?? jsonPath)}.`, next], ...files(),
+  });
+  const source = texPath ?? jsonPath;
+  // After a change to the CV's settings or files: the same command again.
+  const again = `then run: ${pdfCommand(source)}`;
+  // After a change to its text: the .json, which is where the text is changed, and which a .tex has to keep to.
+  const afterEdit = `then run: ${pdfCommand(jsonPath)}`;
+  ui.note(`\n📄  Compiling ${shown(source)} to PDF`);
+
+  // -- The files: the .tex and its header, the .json. -------------------------
+  let texSource = null;
+  let templateName = null;
+  let engine = null;
+  if (texPath) {
+    try {
+      texSource = readFileSync(texPath, 'utf-8');
+    } catch (err) {
+      return fail(`Could not read ${shown(texPath)}: ${err.message}`, 'BAD_INPUT', `Fix that, ${again}`);
+    }
+    templateName = templateNameOf(texSource);
+    if (!templateName) {
+      return fail('This .tex does not say which template it was made from: its first line must read '
+        + '% career-ops-latex: template=<name>.', 'BAD_INPUT', `Put that line back at the top of the .tex, ${again}`);
+    }
+    try {
+      ({ engine } = readTemplateOptions(texSource));
+    } catch (err) {
+      return fail(`${shown(texPath)}, ${String(err?.message ?? err)}`, 'BAD_INPUT', `Fix that line of the .tex, ${again}`);
+    }
+    if (!statSync(jsonPath, { throwIfNoEntry: false })?.isFile()) {
+      return fail(`pdf needs the payload of this .tex: ${basename(jsonPath)} was not found beside it.`, 'BAD_INPUT',
+        `Put ${basename(jsonPath)} back beside it, ${again}`);
+    }
+  }
+  let text;
+  try {
+    text = readFileSync(jsonPath, 'utf-8');
+  } catch (err) {
+    return fail(`Could not read ${shown(jsonPath)}: ${err.message}`, 'BAD_INPUT', `Fix that, ${again}`);
+  }
+  // Read as a reply is: what is not a payload there is not one here.
+  const problem = cvPayloadProblem(text);
+  if (problem) return fail(`${shown(jsonPath)} is not a CV payload: ${problem}.`, 'BAD_INPUT', `Fix ${shown(jsonPath)}, ${afterEdit}`);
+
+  // -- What the CV is checked with, and its header. --------------------------
+  const candidate = loadCandidate(workspace);
+  if (!candidate.ok) return fail(candidate.reason, 'SETUP', `Fix that, ${again}`);
+  const limit = await readCvPageLimit(workspace);
+  if (!limit.ok) return fail(limit.reason, 'SETUP', `Fix cv.max_pages or cv.strict_pages in config/profile.yml, ${again}`);
+  const tools = await loadCvCheckTools(workspace, candidate);
+  if (!tools.ok) return fail(tools.reason, tools.code, `Fix that, ${again}`);
+  const unplaced = tools.lockedKeys.find((key) => !LATEX_SECTION_KEYS.includes(key));
+  if (unplaced !== undefined) return fail(unplacedLockedSection(unplaced), 'SETUP', `Then run: ${pdfCommand(source)}`);
+  const header = readCvHeader(candidate.profileYml);
+  if (!header.name) {
+    return fail('config/profile.yml has no candidate.full_name: the CV header needs it.', 'SETUP',
+      `Add it under candidate: in config/profile.yml, ${again}`);
+  }
+
+  // -- The template. ----------------------------------------------------------
+  if (!texPath) {
+    // The template the tailoring run wrote it in, which `tailor` keeps in the .json.
+    let named = template;
+    if (named === undefined) {
+      try {
+        named = JSON.parse(extractJsonObject(text))?.template;
+      } catch { /* none, then */ }
+    }
+    templateName = named === undefined || named === null || named === '' ? readCvFormat({}, candidate.profileYml).template : named;
+  }
+  const chosen = resolveLatexTemplate(templateName, { dataRoot: workspace.dataRoot });
+  if (!chosen.ok) {
+    return fail(chosen.reason, 'SETUP', texPath ? `Fix the template, ${again}` : `Fix the template, or name another with --template, ${again}`);
+  }
+  engine ??= chosen.options.engine;
+
+  // -- The checks, which repair nothing. ---------------------------------------
+  // On the dates as the template in use prints them: the one the .tex names,
+  // whose rendering of the .json a .tex has to match, or the one the .json is
+  // written in.
+  let checked;
+  try {
+    checked = checkCvPayload(parseCvPayload(text), tools, { repair: false, shownDates: shownDatesFor(chosen.options) });
+  } catch (err) {
+    if (err?.lockedSection) {
+      return fail(err.message, 'LOCKED_SECTIONS',
+        `The section is locked under cv.locked_sections in config/profile.yml: copy it from cv.md into ${shown(jsonPath)}, ${afterEdit}`);
+    }
+    return fail(`The fact check could not run on ${shown(jsonPath)}: ${String(err?.message ?? err)}`, 'SETUP', `Fix that, ${again}`);
+  }
+  const { check } = checked;
+  // A link the link rule takes off is a finding here: the .json is not rewritten, so it would be compiled.
+  const links = checked.unlinked.map((address) => ({
+    key: `link=${address}`,
+    text: `a link to an address none of your files (cv.md, config/profile.yml, article-digest.md) holds: ${address}`,
+  }));
+  if (check.verdict === 'block' || links.length > 0) {
+    const facts = check.findings.filter(({ key }) => key !== 'experience-order');
+    const unordered = facts.length < check.findings.length;
+    const findings = [...check.findings, ...links];
+    const what = [
+      ...(facts.length > 0 ? ['it states what cv.md and article-digest.md do not'] : []),
+      ...(unordered ? ['its roles are not newest-first by start date'] : []),
+      ...(links.length > 0 ? [`it links to ${links.length === 1 ? 'an address' : 'addresses'} none of your files holds`] : []),
+    ];
+    return fail(
+      `${facts.length === findings.length ? 'The fact check blocks' : 'The checks block'} this CV: ${what.join(', and ')} `
+        + `(${findings.length} finding${findings.length === 1 ? '' : 's'}).`,
+      'FACT_CHECK',
+      `Change that in ${shown(jsonPath)}${facts.length > 0 ? ', or add the evidence to cv.md or article-digest.md' : ''}, ${afterEdit}`,
+      { hints: findings.map(({ text: finding }) => `- ${finding}`) },
+    );
+  }
+  // Listed here, as generate-pdf.mjs lists the warnings of an HTML CV it renders.
+  const { factTools } = tools;
+  const factsOf = () => factTools.gate.verifyFacts(tools.checks.normalizeTextForATS(checked.html).html, factTools.inputs);
+  let listed = null;
+  if (check.verdict === 'warn') {
+    ui.note(`⚠️   The fact check passes this CV with ${check.warnings} warning${check.warnings === 1 ? '' : 's'}:`);
+    listed = factsOf();
+    factTools.gate.printFactWarnings(listed, (line) => ui.note(`  ${line}`));
+  }
+
+  // -- The .tex: written from the .json, or held to it. -----------------------
+  let rendered;
+  try {
+    rendered = renderCvTex({
+      template: chosen.text, templateName: chosen.name, payload: checked.payload, header,
+      paper: texPath ? paperOfTex(texSource) : paper ?? resolvePageFormat(undefined, { profilePath: workspace.profileYml }),
+      date: new Date(),
+    }).tex;
+  } catch (err) {
+    return fail(`The CV cannot be written in the template "${chosen.name}": ${String(err?.message ?? err)}`, 'SETUP', `Fix that, ${again}`);
+  }
+  if (texPath) {
+    const given = contentMacros(texSource);
+    const expected = contentMacros(rendered);
+    const at = Array.from({ length: Math.max(given.length, expected.length) }, (_, index) => index)
+      .find((index) => given[index] !== expected[index]);
+    if (at !== undefined) {
+      return fail(`The text of ${basename(texPath)} is not the text of ${basename(jsonPath)}. Change the text in the .json and run pdf `
+        + 'on it: a .tex may change layout only.', 'FACT_CHECK', `Change the text in ${shown(jsonPath)}, ${afterEdit}`, {
+        hints: [`In the .tex: ${shownCall(given[at])}`, `From the .json: ${shownCall(expected[at])}`],
+      });
+    }
+  }
+  const tex = texSource ?? rendered;
+  const texOut = texPath ?? join(workspace.output, `${basename(jsonPath).replace(/\.json$/i, '')}.tex`);
+
+  // -- The final text check, on the .tex that is compiled. -------------------
+  let finalCheck;
+  try {
+    finalCheck = await finalTextCheck(tex, { ui, workspace, factTools, label: basename(texOut), listed: () => listed ?? factsOf() });
+  } catch (err) {
+    return fail(`The final text check could not run: ${String(err?.message ?? err)}`, 'SETUP', `Fix that, ${again}`);
+  }
+  if (finalCheck.verdict === 'block') {
+    return fail(`The final text check blocks this CV: ${String(finalCheck.reason).replace(/\s+/g, ' ').trim()}`, 'FACT_CHECK',
+      `Reword that in ${shown(jsonPath)}, or add the evidence to cv.md or article-digest.md, ${afterEdit}`,
+      { hints: misreadEscapeHint(tex, factTools) });
+  }
+  const factWarnings = check.warnings + finalCheck.added;
+
+  if (!texPath) {
+    try {
+      mkdirSync(workspace.output, { recursive: true });
+      const backup = writeKeepingPrevious(texOut, tex);
+      if (backup) ui.note(`    An earlier .tex of this CV was replaced. It is kept as ${shown(backup)}.`);
+    } catch (err) {
+      return fail(`Could not save ${shown(texOut)}: ${err.message}`, 'SAVE', `Fix that, ${again}`);
+    }
+    texFile = texOut;
+  }
+  // The command that compiles this CV again once the compile, the PDF or its
+  // row is mended: the .tex, when its .json is the one beside it, which
+  // `pdf <tex>` reads; else the .json, which writes that .tex again. A .json
+  // kept outside output/ leaves its .tex there with no .json beside it, or
+  // with another one, and `pdf <tex>` refused it. Nor is that .tex the place
+  // to fix the layout: the next `pdf` of the .json writes it again.
+  const besideItsJson = Boolean(texPath) || samePlace(jsonPath, texFile.replace(/\.tex$/i, '.json'));
+  const rerun = pdfCommand(besideItsJson ? texFile : jsonPath);
+
+  // -- The compile, and the page limit. ---------------------------------------
+  const compile = ctx.compileLatex ?? compileLatex;
+  let compiled;
+  try {
+    compiled = await compile({ tex, packDir: chosen.packDir, engine });
+  } catch (err) {
+    compiled = { ok: false, code: 'COMPILE', reason: `The compile stopped (${String(err?.message ?? err)}).` };
+  }
+  if (compiled?.leftover) ui.note(`⚠️   The build folder could not be removed: ${compiled.leftover}. It holds a copy of the CV.`);
+  if (!compiled?.ok) {
+    const missing = compiled?.code === 'NO_ENGINE';
+    let mend = 'Fix the template';
+    if (missing) mend = `Install ${engine}`;
+    else if (besideItsJson) mend = 'Fix the template or the .tex';
+    return fail(String(compiled?.reason ?? 'The compile gave no result.'), missing ? 'NO_ENGINE' : 'LATEX', `${mend}, then run: ${rerun}`);
+  }
+  const pdfPath = join(workspace.output, `${basename(texFile).replace(/\.tex$/i, '')}.pdf`);
+  let pdfIo;
+  try {
+    pdfIo = await loadPdfTools();
+    mkdirSync(workspace.output, { recursive: true });
+  } catch (err) {
+    return fail(`The PDF cannot be saved: ${String(err?.message ?? err)}`, 'PDF_NOT_WRITTEN', `Fix that, then run: ${rerun}`);
+  }
+  if (compiled.pages > limit.maxPages) {
+    let draft;
+    try {
+      draft = writeOverflowDraft(pdfPath, compiled.pdf);
+    } catch (err) {
+      return fail(`The CV is ${compiled.pages} pages; the allowed maximum is ${limit.maxPages}.`, 'PDF_NOT_WRITTEN',
+        `Its draft could not be saved either (${err.message}). Shorten the CV in ${shown(jsonPath)}, ${afterEdit}`);
+    }
+    return fail(`The CV is ${compiled.pages} pages; the allowed maximum is ${limit.maxPages}.`, 'PDF_NOT_WRITTEN',
+      `The draft is kept: ${shown(draft)}. Shorten the CV in ${shown(jsonPath)}, ${afterEdit}`);
+  }
+  try {
+    // Written whole, under a name of its own first: a PDF that is there is the new one, never a part of it.
+    pdfIo.writeFileAtomic(pdfPath, compiled.pdf);
+  } catch (err) {
+    return fail(`Could not save ${shown(pdfPath)}: ${err.message}`, 'PDF_NOT_WRITTEN', `Fix that, then run: ${rerun}`);
+  }
+
+  // -- The row that ticks the tracker. ----------------------------------------
+  let indexed = null;
+  try {
+    indexed = await indexCompiledPdf({ pdfPath, reportNum, paper: paperOfTex(tex) }, workspace, ui);
+  } catch (err) {
+    ui.note(`⚠️   The PDF is saved, but data/pdf-index.tsv could not be updated (${String(err?.message ?? err)}): the next `
+      + `\`npm run merge\` does not tick it in the tracker. Run ${rerun} again to record it.`);
+  }
+  ui.out(`✅  PDF saved: ${shown(pdfPath)}`);
+  if (factWarnings > 0) {
+    ui.note(`    The fact check passed it with ${factWarnings} warning${factWarnings === 1 ? '' : 's'}, listed above: `
+      + 'claims to confirm against cv.md before you send the CV.');
+  }
+  if (compiled.missingGlyphs?.length > 0) {
+    ui.note(`⚠️   The PDF lacks these characters, which the template's font does not have: ${compiled.missingGlyphs.join(', ')}.`);
+  }
+  return { success: true, path: shown(pdfPath), pdfPath, pages: compiled.pages, factWarnings, indexed, ...files() };
+}
+
+/** Refused for a .tex: what it would choose is written in the .tex. */
+const TEX_TEMPLATE_REFUSAL = '--template cannot be used with a .tex file: its first line names the template.';
+const TEX_PAPER_REFUSAL = '--format cannot be used with a .tex file: the paper size is written in it.';
+
+/**
+ * `pdf` for a CV in LaTeX: compileCvPdf(), its receipt, and the line about
+ * the tracker for a PDF whose row names a report.
+ *
+ * @param {CommandContext} ctx
+ * @param {Parameters<typeof compileCvPdf>[0]} job
+ * @param {string} [report] The report the CV was found for, as the data root names it.
+ * @returns {Promise<number>} The exit code.
+ */
+async function pdfOfLatexCv(ctx, job, report) {
+  const result = await compileCvPdf(job, ctx);
+  ctx.ui.receipt({
+    command: 'pdf',
+    success: result.success,
+    format: 'latex',
+    ...(result.tex ? { tex: result.tex } : {}),
+    ...(result.payload ? { payload: result.payload } : {}),
+    ...(report ? { report } : {}),
+    ...(result.success
+      ? { pdf: result.path, pages: result.pages, factWarnings: result.factWarnings }
+      : { reason: result.reason, code: result.code }),
+  });
+  if (result.success && result.indexed) ctx.ui.note(PDF_TRACKER_HINT);
+  return result.success ? 0 : 1;
+}
+
 async function cmdPdf(ctx) {
   const { flags, ui } = ctx;
   const ref = soleArgument(ctx);
@@ -3756,7 +5162,37 @@ async function cmdPdf(ctx) {
   }
 
   const workspace = ctx.workspace();
-  const source = findTailoredCv(workspace, ref);
+  // A file named by its path is in the format its extension names. The CV of
+  // a report is in the format the flags and the profile choose (readCvFormat()).
+  const wanted = String(ref).trim();
+  const kind = [['html', /\.html?$/i], ['tex', /\.tex$/i], ['json', /\.json$/i]].find(([, extension]) => extension.test(wanted))?.[0];
+  if (kind) {
+    const formatFlag = ['latex', 'html'].find((key) => flags[key]);
+    if (formatFlag) return refuse(ctx, `--${formatFlag} cannot be used with a file: its extension names the format.`);
+    if (flags.template !== undefined && kind === 'tex') return refuse(ctx, TEX_TEMPLATE_REFUSAL);
+    if (flags.template !== undefined && kind === 'html') {
+      return refuse(ctx, '--template cannot be used with an HTML file: it names the template of a LaTeX CV.');
+    }
+    if (format && kind === 'tex') return refuse(ctx, TEX_PAPER_REFUSAL);
+  }
+  if (kind === 'tex' || kind === 'json') {
+    const path = namedFile(workspace, wanted);
+    if (!path) return refuse(ctx, `LaTeX file not found: ${wanted}`, 'BAD_INPUT');
+    return pdfOfLatexCv(ctx, kind === 'tex' ? { texPath: path } : { payloadPath: path, template: flags.template, paper: format });
+  }
+  if (!kind && readCvFormat(flags, profileText(workspace)).format === 'latex') {
+    const found = findTailoredLatexCv(workspace, wanted);
+    if (!found.ok) return refuse(ctx, found.reason, 'BAD_INPUT');
+    if (found.texPath && format) return refuse(ctx, TEX_PAPER_REFUSAL);
+    if (found.texPath && flags.template !== undefined) return refuse(ctx, TEX_TEMPLATE_REFUSAL);
+    return pdfOfLatexCv(ctx, {
+      ...(found.texPath ? { texPath: found.texPath } : { template: flags.template, paper: format }),
+      payloadPath: found.payloadPath,
+      reportNum: found.reportNum,
+    }, found.report);
+  }
+
+  const source = findTailoredCv(workspace, ref, profileCvFormat(workspace));
   if (!source.ok) return refuse(ctx, source.reason, 'BAD_INPUT');
 
   const result = renderCvPdf({ htmlPath: source.htmlPath, reportNum: source.reportNum, format }, ctx);
@@ -4768,6 +6204,8 @@ async function markPipelineFailed(url, why, { pipelinePath }) {
 // `{ success, path?, reason?, code? }`, with `path` as the data root names the
 // file it wrote. A tailoring the fact check still blocks is the one failure
 // that has a `path`: the CV is kept for the owner, and it is not a success.
+// A tailoring in LaTeX adds `format: 'latex'`: its `path` is a .tex, which the
+// pdf step compiles (compileCvPdf()) where it renders an HTML CV.
 //
 // `needs` names a step that has to have succeeded first, so no PDF is
 // rendered from a CV that failed, kept or not. Nothing else is skipped:
@@ -4776,6 +6214,7 @@ async function markPipelineFailed(url, why, { pipelinePath }) {
 const AFTER_EVALUATION = {
   tailor: {
     run: async (evaluation, ctx) => {
+      // In the format and the template the command chose (stepDeps()).
       const result = await tailorCv(evaluation.relPath, stepDeps(ctx));
       // The window only grows during a run. A CV prompt that needed a larger
       // one than the evaluations did moves the rest of the run to that size,
@@ -4786,6 +6225,9 @@ const AFTER_EVALUATION = {
         ...(result.rewritten?.length ? { rewritten: result.rewritten } : {}),
         ...(result.unlinked?.length ? { unlinked: result.unlinked } : {}),
         ...(result.factCheck ? { factCheck: result.factCheck } : {}),
+        // A CV in LaTeX says so, for the step below to compile it. An HTML
+        // one says nothing it did not say before.
+        ...(result.format === 'latex' ? { format: 'latex' } : {}),
       };
       return result.success
         ? { success: true, path: result.relPath, ...facts }
@@ -4799,10 +6241,11 @@ const AFTER_EVALUATION = {
     needs: 'tailor',
     run: async (evaluation, ctx, before) => {
       const tailored = before.find((outcome) => outcome.step === 'tailor');
-      const result = renderCvPdf({
-        htmlPath: resolve(ctx.workspace().dataRoot, tailored.path),
-        reportNum: evaluation.reportNum,
-      }, ctx);
+      const saved = resolve(ctx.workspace().dataRoot, tailored.path);
+      // The .tex a LaTeX tailoring saved, compiled once its .json is checked again; an HTML CV, rendered by generate-pdf.mjs.
+      const result = tailored.format === 'latex'
+        ? await compileCvPdf({ texPath: saved, reportNum: evaluation.reportNum }, ctx)
+        : renderCvPdf({ htmlPath: saved, reportNum: evaluation.reportNum }, ctx);
       return result.success
         ? { success: true, path: result.path, factWarnings: result.factWarnings }
         : { success: false, reason: result.reason, code: result.code };
@@ -4840,9 +6283,30 @@ function stepDetail(step) {
   return `${step.path ?? 'done'}${notes.length > 0 ? ` (${notes.join(', ')})` : ''}`;
 }
 
-/** What a step after an evaluation works with: the run's settings, files, token counts and session. */
+/**
+ * What a step after an evaluation works with: the run's settings, files,
+ * token counts and session, and the format and template of the CV with the
+ * engine check of a LaTeX CV to compile (`ctx.cv`, cvStepChoice()).
+ */
 function stepDeps(ctx) {
-  return { ...ctx.ollama(), ui: ctx.ui, workspace: ctx.workspace(), tracker: ctx.tracker, session: ctx.session };
+  return { ...ctx.ollama(), ui: ctx.ui, workspace: ctx.workspace(), tracker: ctx.tracker, session: ctx.session, ...ctx.cv };
+}
+
+/**
+ * The format and the template a command that tailors after an evaluation
+ * (`pipeline`, `run`) makes the CV in, as the flags and the profile choose
+ * them (readCvFormat()), with the engine check of tailorCv() when a LaTeX CV
+ * is compiled after it: asked before the model, so a missing engine does not
+ * cost a tailoring that cannot become a PDF.
+ *
+ * @param {CommandContext} ctx
+ * @param {boolean} withPdf Whether a pdf step follows the tailoring.
+ * @returns {{format: 'html'|'latex', template: string, compileCheck: false|Function}}
+ * @throws {CommandLineError} For --latex with --html, and for --template on a CV that is not made in LaTeX.
+ */
+function cvStepChoice(ctx, withPdf) {
+  const choice = readCvFormat(ctx.flags, profileText(ctx.workspace()));
+  return { ...choice, compileCheck: choice.format === 'latex' && withPdf ? ctx.latexEngineProblem : false };
 }
 
 /**
@@ -4993,6 +6457,13 @@ async function cmdPipeline(ctx) {
   const minScore = readMinScore(flags);
   // A PDF is rendered from the tailored CV, so asking for one asks for both.
   const steps = flags.pdf ? ['tailor', 'pdf'] : flags.tailor ? ['tailor'] : [];
+  // The format of a CV this run makes: a choice that means nothing when it makes none.
+  if (steps.length === 0) {
+    const unused = ['latex', 'html', 'template'].find((key) => flags[key] !== undefined);
+    if (unused) return refuse(ctx, `--${unused} needs --tailor or --pdf: it chooses the format of the tailored CV.`);
+  } else {
+    ctx.cv = cvStepChoice(ctx, steps.includes('pdf'));
+  }
 
   const { cfg, client } = ctx.ollama();
   const workspace = ctx.workspace();
@@ -5092,7 +6563,7 @@ async function cmdPipeline(ctx) {
           if (result.stops.length > 0) {
             // Reached the score and not the steps.
             ui.note('    No CV for this one, for that reason.');
-            ui.note(`    ${afterStopHint(result.reportNum)}`);
+            ui.note(`    ${afterStopHint(result.reportNum, ctx.cv, profileCvChoice(workspace))}`);
           } else {
             afterwards.set(item.url, await runAfterEvaluation(result, steps, ctx));
           }
@@ -5190,6 +6661,8 @@ async function cmdRun(ctx) {
     return refuse(ctx, '--no-save cannot be used with run: the CV and the answers are made from the saved report.');
   }
   const minScore = readMinScore(flags);
+  // The format of the CV, refused now if the flags contradict each other: the CV comes after the evaluation.
+  ctx.cv = cvStepChoice(ctx, true);
   const { url, text } = evaluationInput(flags, positionals);
   if (!url && !flags.file && !text) {
     return refuse(ctx, `run needs a posting. Usage: node ollama-runner.mjs ${COMMANDS.run.synopsis}`);
@@ -5249,7 +6722,9 @@ async function cmdRun(ctx) {
     steps = await runAfterEvaluation(evaluation, ['tailor', 'pdf', 'apply'], ctx, { minScore, questionsFile: flags.questions });
   }
   if (stopped) ui.note(`Stopping after the evaluation: ${stopped}.`);
-  if (stopped && evaluation.success && evaluation.score >= minScore) ui.note(afterStopHint(evaluation.reportNum));
+  if (stopped && evaluation.success && evaluation.score >= minScore) {
+    ui.note(afterStopHint(evaluation.reportNum, ctx.cv, profileCvChoice(workspace)));
+  }
 
   // -- The tracker. ---------------------------------------------------------
   const { merged, created: trackerCreated } = mergeWaiting();
@@ -5489,6 +6964,10 @@ const GLOBAL_FLAGS = {
  *   command; a step that needed a larger window leaves the larger session here.
  * @property {(url: string) => Promise<string>} [fetchPage] Set by tests only.
  * @property {Function} [checkOllama] Set by tests only.
+ * @property {typeof compileLatex} compileLatex Compiles a LaTeX CV: compileLatex(), or a test's stand-in.
+ * @property {typeof latexEngineProblem} latexEngineProblem Asks the engine of a LaTeX CV whether it is there.
+ * @property {ReturnType<typeof cvStepChoice>} [cv] The format and the template of the CV `pipeline` and `run`
+ *   make after an evaluation. Set by the command.
  */
 
 /** The form's questions for the answers. `apply` and `run` take the same option. */
@@ -5501,6 +6980,23 @@ const QUESTIONS_FLAG = {
 const POSTING_FLAGS = {
   '--file': { key: 'file', value: '<path>', help: 'Read the job description from a file' },
   '--posting-url': { key: 'postingUrl', value: '<url>', help: 'Where the posting lives; recorded in the report and the tracker row' },
+};
+
+/**
+ * The format of the tailored CV, and the template of a LaTeX one
+ * (readCvFormat()). `tailor`, `pipeline`, `run` and `pdf` take the same ones.
+ * None has a default here, so a command line without them parses to no key:
+ * the profile decides then.
+ */
+const CV_FORMAT_FLAGS = {
+  '--latex': {
+    key: 'latex', help: 'The CV in LaTeX: a .json of its text and a .tex made from a template (default: cv.output_format in config/profile.yml, else HTML)',
+  },
+  '--html': { key: 'html', help: 'The CV in HTML, whatever cv.output_format in config/profile.yml says' },
+  '--template': {
+    key: 'template', value: '<name>',
+    help: 'The template of a LaTeX CV: default, or a pack in data/templates/<name>/ (default: cv.latex_template in config/profile.yml)',
+  },
 };
 
 /**
@@ -5542,6 +7038,7 @@ const COMMANDS = {
       '--tailor': { key: 'tailor', help: 'Also tailor the CV for each posting that reaches --min-score, unless its report advises against applying' },
       '--pdf': { key: 'pdf', help: 'Also render that tailored CV to PDF (implies --tailor)' },
       '--no-merge': { key: 'noMerge', help: 'Leave the tracker rows in batch/tracker-additions/' },
+      ...CV_FORMAT_FLAGS,
     },
     noArguments: true,
     needsJobTools: () => true,
@@ -5549,18 +7046,21 @@ const COMMANDS = {
   },
   tailor: {
     synopsis: 'tailor <report>',
-    summary: 'Tailor the CV to one evaluated posting: writes the HTML to output/',
+    summary: 'Tailor the CV to one evaluated posting: writes the HTML, or with --latex the .json and .tex, to output/',
     flags: {
       '--jd': { key: 'jd', value: '<path>', help: 'Job description file, for a report that does not archive its posting' },
       '--pdf': { key: 'pdf', help: 'Also render the tailored CV to PDF' },
+      ...CV_FORMAT_FLAGS,
     },
     run: cmdTailor,
   },
   pdf: {
+    // The synopsis names the HTML file alone: tests/ollama-runner-tailor.test.mjs pins the usage line it makes.
     synopsis: 'pdf <report | file.html>',
-    summary: 'Render a tailored CV to PDF with generate-pdf.mjs; no model involved',
+    summary: 'Render a tailored CV to PDF (an HTML CV with generate-pdf.mjs; a .tex or .json CV with a LaTeX engine); no model involved',
     flags: {
       '--format': { key: 'format', value: '<letter|a4>', help: 'Paper size (default: page_format in config/profile.yml, else letter)' },
+      ...CV_FORMAT_FLAGS,
     },
     run: cmdPdf,
   },
@@ -5582,6 +7082,7 @@ const COMMANDS = {
       '--min-score': { key: 'minScore', value: '<x>', help: `Score the posting needs for the CV, the PDF and the answers (default ${APPLY_MIN.toFixed(1)})` },
       '--questions': QUESTIONS_FLAG,
       '--no-merge': { key: 'noMerge', help: 'Leave the tracker row in batch/tracker-additions/' },
+      ...CV_FORMAT_FLAGS,
     },
     needsJobTools: () => true,
     run: cmdRun,
@@ -5830,9 +7331,14 @@ function usageText() {
  *   the default is fetchJobPage.
  * @param {Function} [seams.checkOllama] In place of the checks `doctor`
  *   prints; the default is lib/ollama-doctor.mjs's.
+ * @param {Function} [seams.compileLatex] In place of compileLatex() of
+ *   lib/ollama-cv-latex.mjs, which runs a TeX engine, with its contract. Its
+ *   `engineProblem` property, when it has one, stands in for
+ *   latexEngineProblem(), the question the runner asks the engine before the
+ *   model: without one, the engine counts as there.
  * @returns {Promise<number>}
  */
-export async function main(argv, { fetchPage, checkOllama } = {}) {
+export async function main(argv, { fetchPage, checkOllama, compileLatex: compileSeam } = {}) {
   // Before anything can read a .env: what a child process may be handed
   // depends on which variables the shell itself set (childEnvironment()).
   shellVariables = new Set(Object.keys(process.env).map(variableKey));
@@ -5888,6 +7394,9 @@ export async function main(argv, { fetchPage, checkOllama } = {}) {
       dataRoot,
       fetchPage,
       checkOllama,
+      // The compile of a LaTeX CV, and the question it asks the engine first.
+      compileLatex: compileSeam ?? compileLatex,
+      latexEngineProblem: compileSeam ? (compileSeam.engineProblem ?? (async () => null)) : latexEngineProblem,
       tracker: new TokenAccumulator(),
       workspace: () => openWorkspace(),
       /** The settings and the client, read once. Throws OllamaConfigError for a setting that cannot be used. */
